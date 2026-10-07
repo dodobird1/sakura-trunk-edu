@@ -1,0 +1,617 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Sakura 设置</title>
+    <link rel="stylesheet" href="./styles.css" />
+    <script type="module" src="../core/tooltip.js"></script>
+  </head>
+  <body data-icon-motion="click">
+    <main class="settings-shell">
+      <aside class="nav-card" aria-label="设置分类" data-submission-lock>
+        <div class="nav-brand">
+          <span class="nav-brand-text">Sakura</span>
+        </div>
+        <nav class="nav-list">
+          <div class="nav-group" role="group" aria-labelledby="navgrp-character">
+            <p class="nav-group-label" id="navgrp-character">角色</p>
+            <button class="nav-item is-active" type="button" data-page="character" aria-current="page">
+              <span class="nav-item-icon" aria-hidden="true"><span class="sakura-icon icon-user-round" aria-hidden="true"></span></span>
+              <span class="nav-item-label">角色与布局</span>
+            </button>
+            <button class="nav-item" type="button" data-page="appearance">
+              <span class="nav-item-icon" aria-hidden="true"><span class="sakura-icon icon-palette" aria-hidden="true"></span></span>
+              <span class="nav-item-label">外观</span>
+            </button>
+          </div>
+          <div class="nav-group" role="group" aria-labelledby="navgrp-ai">
+            <p class="nav-group-label" id="navgrp-ai">智能</p>
+            <button class="nav-item" type="button" data-page="providers">
+              <span class="nav-item-icon" aria-hidden="true"><span class="sakura-icon icon-cloud" aria-hidden="true"></span></span>
+              <span class="nav-item-label">模型服务</span>
+            </button>
+            <button class="nav-item" type="button" data-page="model">
+              <span class="nav-item-icon" aria-hidden="true"><span class="sakura-icon icon-cpu" aria-hidden="true"></span></span>
+              <span class="nav-item-label">模型</span>
+            </button>
+            <button class="nav-item" type="button" data-page="voice">
+              <span class="nav-item-icon" aria-hidden="true"><span class="sakura-icon icon-audio-lines" aria-hidden="true"></span></span>
+              <span class="nav-item-label">语音</span>
+            </button>
+            <button class="nav-item" type="button" data-page="memory">
+              <span class="nav-item-icon" aria-hidden="true"><span class="sakura-icon icon-brain" aria-hidden="true"></span></span>
+              <span class="nav-item-label">记忆</span>
+            </button>
+          </div>
+          <div class="nav-group" role="group" aria-labelledby="navgrp-behavior">
+            <p class="nav-group-label" id="navgrp-behavior">行为</p>
+            <button class="nav-item" type="button" data-page="interaction">
+              <span class="nav-item-icon" aria-hidden="true"><span class="sakura-icon icon-messages-square" aria-hidden="true"></span></span>
+              <span class="nav-item-label">交互</span>
+            </button>
+            <button class="nav-item" type="button" data-page="tools">
+              <span class="nav-item-icon" aria-hidden="true"><span class="sakura-icon icon-wrench" aria-hidden="true"></span></span>
+              <span class="nav-item-label">工具</span>
+            </button>
+          </div>
+          <div class="nav-group" role="group" aria-labelledby="navgrp-system">
+            <p class="nav-group-label" id="navgrp-system">系统</p>
+            <button class="nav-item" type="button" data-page="plugins">
+              <span class="nav-item-icon" aria-hidden="true"><span class="sakura-icon icon-puzzle" aria-hidden="true"></span></span>
+              <span class="nav-item-label">插件</span>
+            </button>
+            <button class="nav-item" type="button" data-page="system">
+              <span class="nav-item-icon" aria-hidden="true"><span class="sakura-icon icon-settings-2" aria-hidden="true"></span></span>
+              <span class="nav-item-label">系统</span>
+            </button>
+            <button class="nav-item" type="button" data-page="open-help" data-hide-when-unavailable hidden>
+              <span class="nav-item-icon" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M9.4 9a2.6 2.6 0 1 1 4.25 2c-.95.73-1.65 1.15-1.65 2.5"/><path d="M12 17h.01"/></svg></span>
+              <span class="nav-item-label">打开遇到问题？</span>
+            </button>
+            <button class="nav-item" type="button" data-page="about">
+              <span class="nav-item-icon" aria-hidden="true"><span class="sakura-icon icon-info" aria-hidden="true"></span></span>
+              <span class="nav-item-label">关于</span>
+            </button>
+          </div>
+        </nav>
+      </aside>
+
+      <section class="detail-card">
+        <header class="page-head">
+          <h1 id="pageTitle" class="page-title">角色与布局</h1>
+          <p id="pageSubtitle" class="page-subtitle" hidden></p>
+        </header>
+
+        <div class="page-scroll" data-submission-lock>
+        <section id="capabilityShell" class="capability-shell" role="status" hidden>
+          <span class="capability-shell-mark" aria-hidden="true">❀</span>
+          <h2>暂无可用设置</h2>
+        </section>
+        <section id="page-character" class="settings-page is-active">
+          <fieldset class="settings-group">
+            <legend>角色与桌宠布局</legend>
+            <div class="setting-row">
+              <label class="setting-row-text" for="characterSelect">
+                <span class="setting-title">当前角色</span>
+              </label>
+              <div class="character-select-controls">
+                <select id="characterSelect"></select>
+                <button id="characterEditorButton" type="button" class="secondary-button">修改角色</button>
+              </div>
+            </div>
+            <div id="visualSetting" class="setting-row">
+              <label class="setting-row-text" for="visualSelect"><span class="setting-title">显示方式</span></label>
+              <div class="character-select-controls">
+                <select id="visualSelect"></select>
+                <button id="visualConfigure" class="secondary-button" type="button">设置</button>
+              </div>
+            </div>
+            <div id="visualStatus" class="visual-status-row" hidden>
+              <span id="visualStatusText" role="status"></span>
+              <button id="visualPluginAction" class="secondary-button" type="button">查看插件</button>
+            </div>
+            <div class="setting-row">
+              <label class="setting-row-text" for="portraitScale">
+                <span class="setting-title">角色大小</span>
+              </label>
+              <div class="slider-control">
+                <input id="portraitScale" class="layout-slider" type="range" step="1" />
+                <output class="slider-value" for="portraitScale"></output>
+              </div>
+            </div>
+            <div class="setting-row">
+              <label class="setting-row-text" for="controlPanelWidth">
+                <span class="setting-title">气泡与输入栏宽度</span>
+              </label>
+              <div class="slider-control">
+                <input id="controlPanelWidth" class="layout-slider" type="range" step="1" />
+                <output class="slider-value" for="controlPanelWidth"></output>
+              </div>
+            </div>
+            <div class="setting-row">
+              <div class="setting-row-text setting-row-help">
+                <label class="setting-title" for="bubbleHeight">气泡高度</label>
+                <button class="setting-help" type="button" aria-label="气泡高度说明" data-tooltip="开启「随内容展开」后，此值为气泡的最低高度。">?</button>
+              </div>
+              <div class="slider-control">
+                <input id="bubbleHeight" class="layout-slider" type="range" step="1" />
+                <output class="slider-value" for="bubbleHeight"></output>
+              </div>
+            </div>
+            <div class="setting-row">
+              <label class="setting-row-text" for="controlPanelOffset">
+                <span class="setting-title">气泡上下位置</span>
+              </label>
+              <div class="slider-control">
+                <input id="controlPanelOffset" class="layout-slider" type="range" step="1" />
+                <output class="slider-value" for="controlPanelOffset"></output>
+              </div>
+            </div>
+            <div class="setting-row">
+              <label class="setting-row-text" for="inputBarOffset">
+                <span class="setting-title">输入栏下移</span>
+              </label>
+              <div class="slider-control">
+                <input id="inputBarOffset" class="layout-slider" type="range" step="1" />
+                <output class="slider-value" for="inputBarOffset"></output>
+              </div>
+            </div>
+            <div class="setting-row">
+              <label class="setting-row-text" for="bubbleAutoExpand">
+                <span class="setting-title">随内容展开</span>
+              </label>
+              <span class="setting-toggle"><input id="bubbleAutoExpand" type="checkbox" /></span>
+            </div>
+          </fieldset>
+
+          <fieldset class="settings-group">
+            <legend>字体大小</legend>
+            <div class="setting-row">
+              <label class="setting-row-text" for="speechFontSize">
+                <span class="setting-title">回复文字</span>
+              </label>
+              <div class="slider-control">
+                <input id="speechFontSize" class="layout-slider" type="range" step="1" />
+                <output class="slider-value" for="speechFontSize"></output>
+              </div>
+            </div>
+            <div class="setting-row">
+              <label class="setting-row-text" for="nameFontSize">
+                <span class="setting-title">角色名字</span>
+              </label>
+              <div class="slider-control">
+                <input id="nameFontSize" class="layout-slider" type="range" step="1" />
+                <output class="slider-value" for="nameFontSize"></output>
+              </div>
+            </div>
+            <div class="setting-row">
+              <label class="setting-row-text" for="inputFontSize">
+                <span class="setting-title">输入框文字</span>
+              </label>
+              <div class="slider-control">
+                <input id="inputFontSize" class="layout-slider" type="range" step="1" />
+                <output class="slider-value" for="inputFontSize"></output>
+              </div>
+            </div>
+          </fieldset>
+          <fieldset class="settings-group">
+            <legend>角色包</legend>
+            <div class="setting-row">
+              <div class="setting-row-text">
+                <span class="setting-title">导入/导出</span>
+                <span id="characterArchiveHint" class="setting-desc"></span>
+              </div>
+              <div class="archive-controls">
+                <button id="characterImportButton" type="button" class="secondary-button">导入角色包…</button>
+                <button id="ttsVoiceImportButton" type="button" class="secondary-button">导入 .voice</button>
+                <button id="characterExportButton" type="button" class="secondary-button">导出</button>
+                <button id="characterDeleteButton" type="button" class="danger-button">删除</button>
+              </div>
+            </div>
+          </fieldset>
+        </section>
+
+        <section id="page-tools" class="settings-page">
+          <fieldset class="settings-group">
+            <legend>工具调用限制</legend>
+            <div class="setting-row">
+              <label class="setting-row-text" for="agentSteps">
+                <span class="setting-title">每轮最多步数</span>
+              </label>
+              <span class="field-unit"><input id="agentSteps" type="number" step="1" data-settings-feature="tools.runtime_limits" /><span class="unit">步</span></span>
+            </div>
+            <div class="setting-row">
+              <label class="setting-row-text" for="toolCallsPerStep">
+                <span class="setting-title">每步最多调用次数</span>
+              </label>
+              <span class="field-unit"><input id="toolCallsPerStep" type="number" step="1" data-settings-feature="tools.runtime_limits" /><span class="unit">次</span></span>
+            </div>
+            <div class="setting-row">
+              <label class="setting-row-text" for="toolCallsPerTurn">
+                <span class="setting-title">每轮最多调用次数</span>
+              </label>
+              <span class="field-unit"><input id="toolCallsPerTurn" type="number" step="1" data-settings-feature="tools.runtime_limits" /><span class="unit">次</span></span>
+            </div>
+          </fieldset>
+        </section>
+
+        <section id="page-plugins" class="settings-page admin-page">
+          <div class="plugin-page-heading"><div><h2>插件 <span id="pluginTotal" class="plugin-count" hidden></span></h2></div>
+            <div id="pluginInstallMenuRoot" class="plugin-install-menu">
+              <button id="pluginInstallMenuButton" aria-label="更多插件操作" class="secondary-button plugin-install-menu__trigger" type="button" aria-haspopup="menu" aria-expanded="false">
+                <span>更多</span>
+                <span class="sakura-icon icon-chevron-down" aria-hidden="true"></span>
+              </button>
+              <div id="pluginInstallMenu" class="plugin-install-menu__panel" role="menu" hidden>
+                <div class="plugin-menu-label">从本地安装</div>
+                <button id="pluginInstallZipButton" type="button" role="menuitem">从 ZIP 安装…</button>
+                <button id="pluginInstallFolderButton" type="button" role="menuitem">从文件夹安装…</button>
+              </div>
+            </div>
+          </div>
+          <div class="admin-toolbar plugin-toolbar">
+            <div id="pluginRoleTabs" class="plugin-role-tabs" role="tablist" aria-label="插件角色"></div>
+            <input id="pluginSearch" class="admin-search" type="search" aria-label="搜索插件" placeholder="搜索名称、作者、ID 或描述…" />
+          </div>
+          <div class="admin-workbench plugin-workbench">
+            <section class="plugin-list-shell" aria-label="插件列表"><div id="pluginList" class="admin-list"></div></section>
+            <aside id="pluginDetail" class="admin-detail" aria-label="插件详情"></aside>
+          </div>
+        </section>
+
+        <section id="page-providers" class="settings-page admin-page">
+          <div id="modelProviderSurface" class="plugin-surface"></div>
+        </section>
+
+        <section id="page-model" class="settings-page">
+          <fieldset class="settings-group">
+            <legend>各项功能使用的模型</legend>
+            <div id="modelSlots" class="dynamic-list"></div>
+          </fieldset>
+
+          <div id="modelSettingsSurface" class="plugin-surface"></div>
+        </section>
+
+        <section id="page-voice" class="settings-page">
+          <div id="voiceUnavailable" class="plugin-surface" hidden></div>
+          <div id="voiceSettings" class="voice-settings">
+            <fieldset class="settings-group" data-settings-feature="voice.tts">
+              <legend>角色语音</legend>
+              <div class="setting-row">
+                <label class="setting-row-text" for="ttsEnabled">
+                  <span class="setting-title">开口说话</span>
+                </label>
+                <span class="setting-toggle"><input id="ttsEnabled" type="checkbox" /></span>
+              </div>
+              <div class="setting-row">
+                <label class="setting-row-text" for="ttsProvider">
+                  <span class="setting-title">语音引擎</span>
+                </label>
+                <select id="ttsProvider"></select>
+              </div>
+              <div id="ttsProviderSettings"></div>
+            </fieldset>
+          </div>
+          <fieldset class="settings-group" id="voiceCacheSettings">
+            <legend>语音缓存</legend>
+            <div class="setting-row">
+              <label class="setting-row-text" for="voiceCacheDirectory">
+                <span class="setting-title">缓存目录</span>
+                <span class="setting-desc">更改目录不会移动已有文件。</span>
+              </label>
+              <input id="voiceCacheDirectory" type="text" spellcheck="false" />
+            </div>
+            <div class="setting-row">
+              <label class="setting-row-text" for="voiceCacheMaxMegabytes">
+                <span class="setting-title">最大容量</span>
+                <span class="setting-desc">超过后按时间删除较早的非收藏缓存。</span>
+              </label>
+              <span class="field-unit"><input id="voiceCacheMaxMegabytes" type="number" min="32" max="20480" step="1" /><span class="unit">MB</span></span>
+            </div>
+            <div class="setting-row">
+              <label class="setting-row-text" for="voiceCacheIdleFill">
+                <span class="setting-title">空闲补齐</span>
+                <span class="setting-desc">后台补齐缺失的语音缓存，不自动播放。</span>
+              </label>
+              <span class="setting-toggle"><input id="voiceCacheIdleFill" type="checkbox" /></span>
+            </div>
+          </fieldset>
+        </section>
+
+        <section id="page-appearance" class="settings-page">
+          <fieldset class="settings-group">
+            <legend>配色</legend>
+            <div id="themeColors" class="theme-colors"></div>
+          </fieldset>
+          <fieldset class="settings-group">
+            <legend>输入栏</legend>
+            <div class="setting-row">
+              <label class="setting-row-text" for="visualEffectMode">
+                <span class="setting-title">外观效果</span>
+              </label>
+              <select id="visualEffectMode" data-settings-feature="appearance.input_visual_effect"></select>
+            </div>
+            <div class="setting-row">
+              <div class="inline-actions">
+                <button id="themeAiButton" class="secondary-button" type="button" data-tooltip="参考角色默认立绘生成配色">AI 生成配色</button>
+                <button id="resetThemeButton" class="secondary-button" type="button">恢复默认配色</button>
+              </div>
+            </div>
+          </fieldset>
+        </section>
+
+        <section id="page-interaction" class="settings-page">
+          <fieldset class="settings-group">
+            <legend>字幕与回复</legend>
+            <div class="setting-row">
+              <label class="setting-row-text" for="subtitleTypingInterval">
+                <span class="setting-title">逐字间隔</span>
+              </label>
+              <span class="field-unit"><input id="subtitleTypingInterval" type="number" step="1" data-settings-feature="chat.presentation_timing" /><span class="unit">ms</span></span>
+            </div>
+            <div class="setting-row">
+              <label class="setting-row-text" for="replySegmentPause">
+                <span class="setting-title">回复分段停顿</span>
+              </label>
+              <span class="field-unit"><input id="replySegmentPause" type="number" step="1" data-settings-feature="chat.presentation_timing" /><span class="unit">ms</span></span>
+            </div>
+            <div class="setting-row">
+              <label class="setting-row-text" for="silentSegmentPause">
+                <span class="setting-title">无语音停留</span>
+                <span class="setting-desc">语音未加载或合成失败时，这段字幕结束后再切下一段。</span>
+              </label>
+              <span class="field-unit"><input id="silentSegmentPause" type="number" step="1" data-settings-feature="chat.presentation_timing" /><span class="unit">ms</span></span>
+            </div>
+          </fieldset>
+
+          <fieldset class="settings-group">
+            <legend>气泡</legend>
+            <div class="setting-row">
+              <label class="setting-row-text" for="bubbleAutoHide">
+                <span class="setting-title">气泡自动隐藏</span>
+              </label>
+              <span class="setting-toggle"><input id="bubbleAutoHide" type="checkbox" data-settings-feature="chat.bubble_auto_hide" /></span>
+            </div>
+            <div class="setting-row">
+              <label class="setting-row-text" for="bubbleAutoHideDelay">
+                <span class="setting-title">无操作后隐藏</span>
+              </label>
+              <span class="field-unit"><input id="bubbleAutoHideDelay" type="number" step="1" data-settings-feature="chat.bubble_auto_hide" /><span class="unit">秒</span></span>
+            </div>
+          </fieldset>
+
+          <div id="screenAwarenessSurface"></div>
+        </section>
+
+        <section id="page-system" class="settings-page">
+          <fieldset class="settings-group" data-settings-feature="telemetry.anonymous_statistics">
+            <legend>匿名统计</legend>
+            <div class="setting-row">
+              <div class="setting-row-text">
+                <span class="setting-title">
+                  发送匿名统计数据
+                  <button id="telemetryHelpButton" type="button" class="setting-help-button" aria-label="了解匿名统计数据"><span class="sakura-icon icon-circle-question-mark" aria-hidden="true"></span></button>
+                </span>
+                <span class="setting-desc">错误报告包含原始报错、调用栈和相关路径；凭据会被替换。</span>
+              </div>
+              <input id="telemetryEnabled" type="checkbox" role="switch" />
+            </div>
+            <div class="setting-row">
+              <div class="setting-row-text">
+                <span class="setting-title">诊断 ID</span>
+                <span class="setting-desc">随机生成，与账号和设备无关；重置只影响后续数据。</span>
+                <code id="telemetryInstallationId" class="path-value">读取中…</code>
+              </div>
+              <div class="archive-controls">
+                <button id="telemetryCopyButton" type="button" class="secondary-button">复制</button>
+                <button id="telemetryRegenerateButton" type="button" class="secondary-button">重新生成</button>
+              </div>
+            </div>
+          </fieldset>
+          <fieldset class="settings-group">
+            <legend>启动</legend>
+            <div class="setting-row">
+              <div class="setting-row-text">
+                <label class="setting-title" for="launchAtLogin">开机自动启动</label>
+              </div>
+              <input id="launchAtLogin" type="checkbox" role="switch" data-settings-feature="system.launch_at_login" disabled />
+            </div>
+          </fieldset>
+          <fieldset class="settings-group">
+            <legend>应用更新</legend>
+            <div class="setting-row">
+              <div class="setting-row-text">
+                <label class="setting-title" for="updateAutoCheck">自动检测更新</label>
+                <span class="setting-desc">启动时检查</span>
+              </div>
+              <input id="updateAutoCheck" type="checkbox" role="switch" checked />
+            </div>
+          </fieldset>
+          <fieldset class="settings-group">
+            <legend>使用帮助</legend>
+            <div class="setting-row">
+              <div class="setting-row-text">
+                <span class="setting-title">新手引导</span>
+              </div>
+              <button id="systemFirstRunGuideButton" type="button" class="secondary-button">
+                <span class="about-action-icon sakura-icon icon-circle-question-mark" aria-hidden="true"></span>重新查看
+              </button>
+            </div>
+          </fieldset>
+          <fieldset class="settings-group">
+            <legend>用户数据</legend>
+            <div class="setting-row">
+              <div class="setting-row-text">
+                <span class="setting-title">数据目录</span>
+                <code id="storageUserRoot" class="path-value"></code>
+              </div>
+              <button id="storageOpenUserRoot" type="button" class="secondary-button" data-tooltip="包含配置、聊天记录、角色和插件">打开数据目录</button>
+            </div>
+            <div class="setting-row">
+              <div class="setting-row-text">
+                <span class="setting-title">迁移角色和数据</span>
+                <span id="legacyRoleDataImportStatus" class="setting-desc" role="status"></span>
+              </div>
+              <button id="legacyRoleDataImportButton" type="button" class="secondary-button" disabled>迁移旧数据</button>
+            </div>
+          </fieldset>
+          <fieldset class="settings-group">
+            <legend>TTS 数据</legend>
+            <div class="setting-row">
+              <div class="setting-row-text">
+                <span class="setting-title">TTS 位置</span>
+                <span class="setting-desc">更改目录不会移动已有文件。</span>
+                <code id="storageTtsRoot" class="path-value"></code>
+                <span id="storageTtsStatus" class="setting-desc"></span>
+              </div>
+              <div class="archive-controls">
+                <button id="storageChooseTtsRoot" type="button" class="secondary-button">更改位置</button>
+                <button id="storageResetTtsRoot" type="button" class="secondary-button">恢复默认</button>
+              </div>
+            </div>
+          </fieldset>
+        </section>
+
+        <section id="page-open-help" class="settings-page launch-help-page">
+          <fieldset class="settings-group launch-help-group">
+            <legend>在 macOS 上允许 Sakura 运行</legend>
+            <p class="launch-help-lead">
+              如果 macOS 提示无法验证开发者，请只在确认 Sakura 来自官方 Release 后继续。
+            </p>
+            <p class="launch-help-notice">
+              下面的 Apple 官方流程只为 Sakura 保存本机例外，不会关闭系统的安全检查。
+            </p>
+            <ol class="launch-help-steps">
+              <li>
+                <span aria-hidden="true">1</span>
+                <div><strong>先尝试打开一次 Sakura</strong><p>尝试后，“仍要打开”按钮才会出现，并保留约一小时。</p></div>
+              </li>
+              <li>
+                <span aria-hidden="true">2</span>
+                <div><strong>打开“系统设置”</strong><p>在侧栏选择“隐私与安全性”，然后向下找到“安全性”。</p></div>
+              </li>
+              <li>
+                <span aria-hidden="true">3</span>
+                <div><strong>点击“仍要打开”</strong><p>确认显示的应用是 Sakura，再继续。</p></div>
+              </li>
+              <li>
+                <span aria-hidden="true">4</span>
+                <div><strong>完成身份验证</strong><p>输入 Mac 登录密码，并再次确认打开。</p></div>
+              </li>
+            </ol>
+            <div class="launch-help-actions">
+              <button id="macosSettingsOpenSystemSettingsButton" type="button" class="secondary-button">打开系统设置</button>
+              <button id="macosSettingsOpenAppleSupportButton" type="button" class="primary-button">查看 Apple 官方说明</button>
+            </div>
+            <p id="macosSettingsOpenHelpStatus" class="launch-help-status" role="status"></p>
+          </fieldset>
+        </section>
+
+        <section id="page-about" class="settings-page about-page">
+          <div class="about-product-card">
+            <div class="about-product-identity">
+              <span class="about-mark" aria-hidden="true">
+                <img src="../assets/sakura-icon.png" alt="" />
+              </span>
+              <div>
+                <h2>Sakura</h2>
+                <span id="aboutVersion" class="about-version">读取版本中…</span>
+              </div>
+            </div>
+            <div class="about-product-actions">
+              <button id="aboutWebsiteButton" type="button" class="secondary-button">
+                <span class="about-action-icon sakura-icon icon-globe" aria-hidden="true"></span>官方网站
+              </button>
+              <button id="aboutRepositoryButton" type="button" class="secondary-button">
+                <span class="about-action-icon about-github-icon" aria-hidden="true"></span>GitHub
+              </button>
+              <button id="aboutChangelogButton" type="button" class="secondary-button">
+                <span class="about-action-icon sakura-icon icon-external-link" aria-hidden="true"></span>更新日志
+              </button>
+              <button id="aboutSponsorButton" type="button" class="secondary-button">
+                <span class="about-action-icon sakura-icon icon-heart" aria-hidden="true"></span>爱发电
+              </button>
+              <button id="updateCheckButton" type="button" class="primary-button about-update-button">
+                <span class="about-action-icon sakura-icon icon-refresh-cw" aria-hidden="true"></span>
+                <span id="updateCheckLabel">检查更新</span>
+              </button>
+              <button id="updateActionButton" type="button" class="primary-button about-update-button about-update-action" hidden>
+                <span id="updateActionIcon" class="about-action-icon sakura-icon icon-circle-arrow-up" aria-hidden="true"></span>
+                <span id="updateActionLabel">下载并安装</span>
+              </button>
+            </div>
+            <div id="updateFeedback" class="about-update-feedback" role="status" aria-live="polite" hidden>
+              <div class="about-update-summary">
+                <span class="about-update-state-icon sakura-icon icon-info" aria-hidden="true"></span>
+                <span id="updateStatus"></span>
+              </div>
+              <p id="updateNotes" class="about-update-notes" hidden></p>
+            </div>
+          </div>
+          <section class="about-components" aria-labelledby="aboutComponentsTitle">
+            <div class="about-components__head">
+              <div>
+                <h3 id="aboutComponentsTitle">组件</h3>
+                <p id="aboutComponentsSummary">正在读取插件组件…</p>
+              </div>
+              <button id="aboutComponentsRefresh" type="button" class="secondary-button">刷新</button>
+            </div>
+            <div id="aboutComponentsState" class="about-components__state" role="status"></div>
+            <div id="aboutComponentsList" class="about-components__list"></div>
+          </section>
+        </section>
+
+        <section id="page-memory" class="settings-page admin-page">
+          <div id="memorySurface" class="plugin-surface"></div>
+        </section>
+        </div>
+
+        <footer>
+          <div class="footer-status">
+            <span class="dirty-flag">● 有未保存的改动</span>
+            <p id="errorText" class="error" role="alert"></p>
+          </div>
+          <button id="cancelButton" class="secondary-button" type="button">关闭</button>
+          <button id="applyButton" class="secondary-button" type="button">应用</button>
+          <button id="saveButton" type="button">保存并关闭</button>
+        </footer>
+      </section>
+    </main>
+
+    <div id="asrSettingsHome" hidden>
+      <div id="asrSettings" class="settings-group">
+        <div class="setting-row">
+          <label class="setting-row-text" for="asrProvider">
+            <span class="setting-title">识别引擎</span>
+            <span class="setting-desc">用于所有角色。</span>
+          </label>
+          <select id="asrProvider"></select>
+        </div>
+        <p id="asrLocation" class="setting-desc"></p>
+        <p id="asrStatus" class="error" role="alert" hidden></p>
+      </div>
+    </div>
+    <div id="asrInputControlsHome" hidden>
+      <div id="asrInputControls" class="asr-input-controls">
+        <div class="setting-row">
+          <label class="setting-row-text" for="asrInputDevice">
+            <span class="setting-title">麦克风</span>
+          </label>
+          <select id="asrInputDevice"><option value="">系统默认</option></select>
+        </div>
+        <div class="plugin-setting-actions">
+          <button id="asrRefreshDevices" type="button" class="secondary-button">刷新设备</button>
+          <button id="asrTestStart" type="button" class="secondary-button">开始测试</button>
+          <button id="asrTestCancel" type="button" class="secondary-button" hidden>取消测试</button>
+        </div>
+        <meter id="asrTestLevel" min="0" max="1" value="0" aria-label="实际麦克风音量" hidden></meter>
+        <output id="asrTestResult" class="asr-test-result" role="status" aria-live="polite"></output>
+      </div>
+    </div>
+
+    <div id="toastStack" class="toast-stack" aria-live="polite"></div>
+
+    <script type="module" src="./settings.js"></script>
+  </body>
+</html>

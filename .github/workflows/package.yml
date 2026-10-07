@@ -1,0 +1,229 @@
+name: Package Runtime v2
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_suffix:
+        description: "可选的测试包后缀，例如 rc1"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  UV_DEFAULT_INDEX: https://pypi.org/simple
+
+jobs:
+  metadata:
+    runs-on: ubuntu-24.04
+    outputs:
+      label: ${{ steps.metadata.outputs.label }}
+      version: ${{ steps.metadata.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Validate the single version source
+        id: metadata
+        shell: bash
+        env:
+          VERSION_SUFFIX: ${{ inputs.version_suffix }}
+        run: |
+          set -euo pipefail
+          version="$(python tools/release/versioning.py)"
+          suffix="$VERSION_SUFFIX"
+          if [[ ! "$suffix" =~ ^[A-Za-z0-9._-]{0,32}$ ]]; then
+            echo "version_suffix contains unsupported characters" >&2
+            exit 1
+          fi
+          label="v${version}"
+          if [ -n "$suffix" ]; then label="${label}-${suffix}"; fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "label=$label" >> "$GITHUB_OUTPUT"
+
+  package:
+    needs: metadata
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: windows-x64
+            runner: windows-2025
+            archive: python-runtime.zip
+          - target: macos-arm64
+            runner: macos-15
+            archive: python-runtime.tar.gz
+          - target: linux-x64
+            runner: ubuntu-24.04
+            archive: python-runtime.tar.gz
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+      PYTHONUTF8: "1"
+      SAKURA_UPDATER_ENDPOINT: https://api.sakura.cialloo.cn/service/v1/latest.json
+      SAKURA_UPDATER_PUBLIC_KEY: ${{ secrets.SAKURA_UPDATER_PUBLIC_KEY }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      - name: Require the updater client public key
+        shell: bash
+        run: test -n "$SAKURA_UPDATER_PUBLIC_KEY"
+
+      - name: Download and verify the frozen Python archive
+        shell: bash
+        run: >-
+          python scripts/runtime_v2_archive.py
+          --manifest desktop/src-tauri/runtime-layouts/${{ matrix.target }}/runtime-manifest.json
+          --output "$RUNNER_TEMP/${{ matrix.archive }}"
+
+      - name: Extract bundled Python (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'python-runtime'
+          New-Item -ItemType Directory -Path $root -Force | Out-Null
+          Expand-Archive -LiteralPath (Join-Path $env:RUNNER_TEMP '${{ matrix.archive }}') -DestinationPath $root
+
+      - name: Install Linux WebKit build prerequisites
+        if: runner.os == 'Linux'
+        timeout-minutes: 8
+        shell: bash
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -euo pipefail
+          sudo apt-get update -o Acquire::Retries=3
+          sudo apt-get install -y --no-install-recommends -o Acquire::Retries=3 \
+            build-essential clang libclang-dev file libssl-dev libasound2-dev libgbm-dev \
+            libpipewire-0.3-dev libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev libxdo-dev librsvg2-dev patchelf
+
+      - name: Extract bundled Python (macOS/Linux)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/python-runtime"
+          tar -xzf "$RUNNER_TEMP/${{ matrix.archive }}" -C "$RUNNER_TEMP/python-runtime" --strip-components=1
+
+      - name: Install the hash-locked release dependencies
+        shell: bash
+        run: >-
+          python -m tools.release.prepare_python_runtime
+          --target ${{ matrix.target }}
+          --python-root "$RUNNER_TEMP/python-runtime"
+          --lock packaging/requirements-${{ matrix.target }}.lock
+
+      - name: Assemble and smoke the immutable distribution
+        shell: bash
+        run: >-
+          python tools/release/stage_distribution.py
+          --target ${{ matrix.target }}
+          --python-root "$RUNNER_TEMP/python-runtime"
+          --output desktop/src-tauri/release-staging
+          --smoke
+
+      - name: Generate the unsigned updater-client overlay
+        shell: bash
+        run: >-
+          python tools/release/tauri_release_config.py
+          --target ${{ matrix.target }}
+          --output desktop/src-tauri/tauri.release.json
+          --updater-client
+
+      - name: Build the Runtime v2 platform bundle
+        working-directory: desktop/src-tauri
+        shell: bash
+        env:
+          SAKURA_REQUIRE_DIAGNOSTIC_MAPPING: "1"
+        run: npx --yes @tauri-apps/cli@2.11.4 build --config tauri.release.json
+
+      - name: Collect Windows Setup and Portable ZIP
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          $artifacts = New-Item -ItemType Directory -Path artifacts -Force
+          $installer = Get-ChildItem desktop/src-tauri/target/release/bundle/nsis -Filter '*.exe' | Select-Object -First 1
+          if (-not $installer) { throw 'NSIS installer was not produced.' }
+          $setup = Join-Path $artifacts.FullName "Sakura-$env:VERSION-windows-x64-setup.exe"
+          Copy-Item -LiteralPath $installer.FullName -Destination $setup
+          python tools/release/stage_distribution.py `
+            --target windows-x64 `
+            --python-root (Join-Path $env:RUNNER_TEMP 'python-runtime') `
+            --output desktop/src-tauri/portable-staging `
+            --portable `
+            --smoke
+          $shell = 'desktop/src-tauri/target/release/sakura.exe'
+          if (-not (Test-Path -LiteralPath $shell)) { throw 'Runtime v2 shell executable was not produced.' }
+          Copy-Item -LiteralPath $shell -Destination desktop/src-tauri/portable-staging/sakura.exe
+          Remove-Item -LiteralPath desktop/src-tauri/portable-staging/release-inventory.json
+          $portable = Join-Path $artifacts.FullName "Sakura-$env:VERSION-windows-x64-portable.zip"
+          Compress-Archive -Path desktop/src-tauri/portable-staging/* -DestinationPath $portable
+
+      - name: Collect Linux AppImage and deb
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          appimage="$(find desktop/src-tauri/target/release/bundle/appimage -maxdepth 1 -name '*.AppImage' -print -quit)"
+          deb="$(find desktop/src-tauri/target/release/bundle/deb -maxdepth 1 -name '*.deb' -print -quit)"
+          test -n "$appimage" && test -n "$deb"
+          cp "$appimage" "artifacts/Sakura-${VERSION}-linux-x64.AppImage"
+          cp "$deb" "artifacts/Sakura-${VERSION}-linux-x64.deb"
+          python tools/release/package_optional_plugin.py \
+            --source plugins/optional/playwright_browser \
+            --output "artifacts/Sakura-Playwright-${VERSION}.sakplugin.zip"
+
+      - name: Collect macOS app and DMG
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          app="$(find desktop/src-tauri/target/release/bundle/macos -maxdepth 1 -name '*.app' -print -quit)"
+          dmg="$(find desktop/src-tauri/target/release/bundle/dmg -maxdepth 1 -name '*.dmg' -print -quit)"
+          test -n "$app" && test -n "$dmg"
+          app_zip="artifacts/Sakura-${VERSION}-macos-arm64.app.zip"
+          dmg_out="artifacts/Sakura-${VERSION}-macos-arm64.dmg"
+          help_source="packaging/macos-open-help.html"
+          help_out="artifacts/Sakura-${VERSION}-macos-open-help.html"
+          app_zip_root="$RUNNER_TEMP/sakura-macos-app-zip"
+          mkdir -p "$app_zip_root"
+          ditto "$app" "$app_zip_root/$(basename "$app")"
+          cp "$help_source" "$app_zip_root/Sakura-macOS-open-help.html"
+          ditto -c -k --sequesterRsrc "$app_zip_root" "$app_zip"
+          cp "$help_source" "$help_out"
+          cp "$dmg" "$dmg_out"
+          python tools/release/package_optional_plugin.py \
+            --source plugins/optional/playwright_browser \
+            --output "artifacts/Sakura-Playwright-${VERSION}.sakplugin.zip"
+
+      - name: Retain diagnostic build mapping
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          cp desktop/src-tauri/release-staging/diagnostic-build.json "artifacts/diagnostic-build-${{ matrix.target }}.json"
+
+      - name: Upload platform artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: runtime-v2-${{ needs.metadata.outputs.label }}-${{ matrix.target }}
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 7

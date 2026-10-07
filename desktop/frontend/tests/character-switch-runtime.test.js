@@ -1,0 +1,321 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import {
+  applyCharacterCatalogChange,
+  applyCharacterSwitch,
+  commitCharacterSelection,
+  hasCharacterScopedDrafts,
+  pendingCharacterSelection,
+  syncCharacterEditorControl,
+  setCharacterSwitchLock,
+  waitForCharacterSwitch,
+} from "../settings/character-switch-runtime.js";
+
+const receipt = Object.freeze({
+  restartState: "requested",
+  previousCoreGenerationId: "generation-a",
+  targetCharacterId: "character-b",
+});
+
+test("character switching accepts a healthy generation after more than sixty seconds", async t => {
+  let clock = 0, reads = 0;
+  t.mock.method(Date, "now", () => clock);
+  const result = await waitForCharacterSwitch({
+    receipt, previousGenerationNumber: 1,
+    readLifecycle: async () => lifecycle({ readiness: ++reads === 1 ? "initializing" : "ready" }),
+    delay: async () => { clock += 61_000; },
+  });
+  assert.equal(result.snapshot.readiness, "ready");
+  assert.equal(reads, 2);
+});
+
+test("generation failure ends switching before a Core snapshot is published", async () => {
+  await assert.rejects(waitForCharacterSwitch({
+    receipt, previousGenerationNumber: 1,
+    readLifecycle: async () => ({ supervisor: { state: "failed", generationId: "generation-b", generationNumber: 2 } }),
+    delay: async () => assert.fail("a retired generation must not keep polling"),
+  }), /CHARACTER_SWITCH_INITIALIZATION_FAILED/);
+});
+
+for (const supervisor of [
+  { state: "stopped", generationId: null, generationNumber: 2 },
+  { state: "stopping", appShutdown: true, generationNumber: 1 },
+]) test("generation retirement ends character switching", async () => {
+  await assert.rejects(waitForCharacterSwitch({
+    receipt, previousGenerationNumber: 1, readLifecycle: async () => ({ supervisor }),
+    delay: async () => assert.fail("a cancelled switch must not keep polling"),
+  }), /CHARACTER_SWITCH_CANCELLED/);
+});
+
+function lifecycle({
+  generationId = "generation-b",
+  generationNumber = 2,
+  readiness = "ready",
+  characterId = "character-b",
+} = {}) {
+  return {
+    supervisor: { generationId, generationNumber },
+    snapshot: { generationId, readiness },
+    characterPresentation: { generationId, characterId },
+  };
+}
+
+test("local character switch clears role state and accepts the same Core generation", async () => {
+  const calls = [];
+  const current = lifecycle({ generationId: "generation-a", generationNumber: 1 });
+  const result = await applyCharacterSwitch({
+    receipt: { ...receipt, restartState: "not_required", characterChanged: true },
+    previousLifecycle: lifecycle({ generationId: "generation-a", generationNumber: 1, characterId: "character-a" }),
+    applyCommittedSnapshot: () => calls.push("snapshot"),
+    clearCharacterState: () => calls.push("clear"),
+    rebindSettings: async () => calls.push("rebind"),
+    setSwitching: value => calls.push(value),
+    readLifecycle: async () => current,
+    delay: async () => assert.fail("ready local switch should not wait"),
+  });
+  assert.equal(result, current);
+  assert.deepEqual(calls, ["snapshot", true, "clear", "rebind", false]);
+});
+
+test("appearance, voice, and character collection drafts block switching", () => {
+  assert.equal(hasCharacterScopedDrafts(), false);
+  assert.equal(hasCharacterScopedDrafts({ appearanceDirty: true }), true);
+  assert.equal(hasCharacterScopedDrafts({ voiceDirty: true }), true);
+  assert.equal(hasCharacterScopedDrafts({ collectionDraftCount: 1 }), true);
+});
+
+test("available character editor clears the stale Runtime v2 placeholder state", () => {
+  const attributes = new Map([
+    ["title", "该设置能力尚未迁移到 Runtime v2"],
+    ["aria-disabled", "true"],
+  ]);
+  const control = {
+    disabled: true,
+    removeAttribute(name) { attributes.delete(name); },
+  };
+
+  syncCharacterEditorControl(control, false);
+
+  assert.equal(control.disabled, false);
+  assert.equal(attributes.has("title"), false);
+  assert.equal(attributes.has("aria-disabled"), false);
+});
+
+test("character choices remain local drafts until apply commits only the final target", async () => {
+  let selectedCharacterId = "character-a";
+  const selectedByBackend = [];
+
+  selectedCharacterId = "character-b";
+  assert.equal(pendingCharacterSelection({
+    committedCharacterId: "character-a",
+    selectedCharacterId,
+  }), "character-b");
+  selectedCharacterId = "character-c";
+  assert.equal(selectedByBackend.length, 0);
+
+  const applied = [];
+  await commitCharacterSelection({
+    committedCharacterId: "character-a",
+    selectedCharacterId,
+    readLifecycle: async () => ({ supervisor: { generationNumber: 7 } }),
+    async selectCharacter(characterId) {
+      selectedByBackend.push(characterId);
+      return { targetCharacterId: characterId };
+    },
+    async applyChange(nextReceipt, previousLifecycle) {
+      applied.push({ nextReceipt, previousLifecycle });
+      return "switched";
+    },
+  });
+
+  assert.deepEqual(selectedByBackend, ["character-c"]);
+  assert.equal(applied.length, 1);
+  assert.equal(applied[0].previousLifecycle.supervisor.generationNumber, 7);
+});
+
+test("selecting the committed character again clears the draft and performs no commit", async () => {
+  assert.equal(pendingCharacterSelection({
+    committedCharacterId: "character-a",
+    selectedCharacterId: "character-a",
+  }), null);
+
+  let lifecycleReads = 0;
+  let backendWrites = 0;
+  const result = await commitCharacterSelection({
+    committedCharacterId: "character-a",
+    selectedCharacterId: "character-a",
+    readLifecycle: async () => { lifecycleReads += 1; },
+    selectCharacter: async () => { backendWrites += 1; },
+    applyChange: async () => {},
+  });
+
+  assert.equal(result, null);
+  assert.equal(lifecycleReads, 0);
+  assert.equal(backendWrites, 0);
+});
+
+test("current character publication rebinds settings only after the announced generation is ready", async () => {
+  const readyLifecycle = lifecycle();
+  const sequence = [];
+  const applied = await applyCharacterCatalogChange({
+    generationId: "generation-b",
+    async readLifecycle() {
+      sequence.push("lifecycle");
+      return readyLifecycle;
+    },
+    async readCatalog() {
+      sequence.push("catalog");
+      return {};
+    },
+    applyCatalog() { sequence.push("apply-catalog"); },
+    async rebindSettings(current) {
+      sequence.push(`rebind:${current.supervisor.generationId}`);
+    },
+  });
+
+  assert.equal(applied, true);
+  assert.deepEqual(sequence, ["lifecycle", "rebind:generation-b"]);
+});
+
+test("non-current character publication refreshes the catalog without rebinding Core settings", async () => {
+  const sequence = [];
+  const catalog = { revision: 3 };
+  const applied = await applyCharacterCatalogChange({
+    async readLifecycle() { sequence.push("lifecycle"); },
+    async readCatalog() {
+      sequence.push("catalog");
+      return catalog;
+    },
+    applyCatalog(current) {
+      assert.equal(current, catalog);
+      sequence.push("apply-catalog");
+    },
+    async rebindSettings() { sequence.push("rebind"); },
+  });
+
+  assert.equal(applied, true);
+  assert.deepEqual(sequence, ["catalog", "apply-catalog"]);
+});
+
+test("catalog events from a superseded generation cannot rebind current settings", async () => {
+  let rebound = false;
+  const applied = await applyCharacterCatalogChange({
+    generationId: "generation-b",
+    readLifecycle: async () => lifecycle({ generationId: "generation-c", generationNumber: 3 }),
+    readCatalog: async () => ({}),
+    applyCatalog() {},
+    async rebindSettings() { rebound = true; },
+  });
+
+  assert.equal(applied, false);
+  assert.equal(rebound, false);
+});
+
+test("switching locks character pages and aggregate submit without locking global pages", () => {
+  const rolePage = { inert: false, attributes: {}, setAttribute(name, value) { this.attributes[name] = value; } };
+  const globalPage = { inert: false };
+  const save = { disabled: false };
+  setCharacterSwitchLock({ pages: [rolePage], submitControls: [save] }, true);
+  assert.equal(rolePage.inert, true);
+  assert.equal(rolePage.attributes["aria-busy"], "true");
+  assert.equal(save.disabled, true);
+  assert.equal(globalPage.inert, false);
+
+  setCharacterSwitchLock({ pages: [rolePage], submitControls: [save] }, false);
+  assert.equal(rolePage.inert, false);
+  assert.equal(save.disabled, false);
+});
+
+test("switch completion requires a newer consistent ready generation and target presentation", async () => {
+  const publications = [
+    lifecycle({ generationId: "generation-a", generationNumber: 1, characterId: "character-a" }),
+    lifecycle({ characterId: "character-a" }),
+    lifecycle(),
+  ];
+  const result = await waitForCharacterSwitch({
+    receipt,
+    previousGenerationNumber: 1,
+    readLifecycle: async () => publications.shift(),
+    delay: async () => {},
+  });
+  assert.equal(result.characterPresentation.characterId, "character-b");
+  assert.equal(publications.length, 0);
+});
+
+test("provider setup still completes a switch when the target presentation is ready", async () => {
+  const result = await waitForCharacterSwitch({
+    receipt,
+    previousGenerationNumber: 1,
+    readLifecycle: async () => lifecycle({ readiness: "setup_required" }),
+    delay: async () => {},
+  });
+  assert.equal(result.snapshot.readiness, "setup_required");
+  assert.equal(result.characterPresentation.characterId, "character-b");
+});
+
+test("switch coordinator clears old role state before waiting and always leaves switching", async () => {
+  const sequence = [];
+  await applyCharacterSwitch({
+    receipt,
+    previousLifecycle: { supervisor: { generationNumber: 1 } },
+    applyCommittedSnapshot() { sequence.push("snapshot"); },
+    clearCharacterState() { sequence.push("clear"); },
+    async rebindSettings(next) {
+      sequence.push(`rebind:${next.characterPresentation.characterId}`);
+    },
+    setSwitching(value) { sequence.push(`switching:${value}`); },
+    readLifecycle: async () => lifecycle(),
+    delay: async () => {},
+  });
+  assert.deepEqual(sequence, [
+    "snapshot",
+    "switching:true",
+    "clear",
+    "rebind:character-b",
+    "switching:false",
+  ]);
+});
+
+test("failed target initialization does not rebind or retry the committed mutation", async () => {
+  let reads = 0;
+  let rebound = false;
+  const switching = [];
+  await assert.rejects(
+    applyCharacterSwitch({
+      receipt,
+      previousLifecycle: { supervisor: { generationNumber: 1 } },
+      applyCommittedSnapshot() {},
+      clearCharacterState() {},
+      rebindSettings() { rebound = true; },
+      setSwitching(value) { switching.push(value); },
+      readLifecycle: async () => {
+        reads += 1;
+        return lifecycle({ readiness: "failed" });
+      },
+      delay: async () => {},
+    }),
+    /CHARACTER_SWITCH_INITIALIZATION_FAILED/,
+  );
+  assert.equal(reads, 1);
+  assert.equal(rebound, false);
+  assert.deepEqual(switching, [true, false]);
+});
+
+test("last-character delete completes when the next generation has no presentation", async () => {
+  const result = await waitForCharacterSwitch({
+    receipt: {
+      restartState: "requested",
+      previousCoreGenerationId: "generation-a",
+      targetCharacterId: null,
+    },
+    previousGenerationNumber: 1,
+    readLifecycle: async () => ({
+      supervisor: { generationId: "generation-b", generationNumber: 2 },
+      snapshot: { generationId: "generation-b", readiness: "setup_required" },
+    }),
+    delay: async () => {},
+  });
+  assert.equal(result.snapshot.readiness, "setup_required");
+  assert.equal(result.characterPresentation, undefined);
+});

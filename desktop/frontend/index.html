@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="character">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <title>Sakura Runtime v2</title>
+    <link rel="stylesheet" href="./styles.css" />
+    <link rel="stylesheet" href="./audio/asr.css" />
+    <script type="module" src="./app.js"></script>
+  </head>
+  <body data-shell-state="loading" data-chat-state="ready">
+    <main id="pet-stage" class="pet-stage" aria-label="Sakura 桌宠">
+      <section id="chat-bubble" class="bubble" data-drag-region="true" aria-label="角色回复">
+        <header class="bubble-header">
+          <div class="identity">
+            <strong id="character-name">Sakura</strong>
+            <span id="chat-phase" class="visually-hidden" role="status">正在准备</span>
+          </div>
+          <button type="button" id="chat-error-log" class="chat-error-log" data-interactive="true" hidden>查看运行日志</button>
+        </header>
+        <div class="reply-body">
+          <div id="bubble-copy" class="bubble-copy" aria-live="polite">
+            正在读取当前角色……
+          </div>
+          <nav id="reply-history-nav" class="reply-history-nav"
+            data-interactive="true"
+            aria-label="回复记录"
+          >
+            <button
+              type="button"
+              id="reply-history-previous"
+              class="reply-history-button"
+              tabindex="-1"
+              aria-label="上一条回复"
+              disabled
+            >
+              <span class="sakura-icon icon-chevron-up" aria-hidden="true"></span>
+            </button>
+            <button
+              type="button"
+              id="reply-history-next"
+              class="reply-history-button"
+              tabindex="-1"
+              aria-label="下一条回复"
+              disabled
+            >
+              <span class="sakura-icon icon-chevron-down" aria-hidden="true"></span>
+            </button>
+          </nav>
+        </div>
+      </section>
+
+      <form id="composer" class="composer" data-interactive="true" aria-label="聊天输入">
+        <button
+          type="button"
+          id="composer-attachment"
+          aria-label="添加附件"
+          aria-haspopup="menu"
+          aria-expanded="false"
+        >
+          <span class="sakura-icon icon-plus" aria-hidden="true"></span>
+        </button>
+        <textarea
+          id="composer-input"
+          rows="1"
+          maxlength="4096"
+          tabindex="-1"
+          lang="zh-CN"
+          aria-label="发送给当前角色的消息"
+          placeholder="和当前角色说点什么……"
+        ></textarea>
+        <div
+          id="composer-attachments"
+          class="composer-attachment-strip"
+          role="list"
+          aria-label="待发送的截图"
+          hidden
+        ></div>
+        <span id="voice-status" role="status" aria-hidden="true"></span>
+        <div id="voice-recording" class="voice-recording" aria-hidden="true">
+          <span class="visually-hidden" role="status">正在录音，再次点击麦克风结束，按 Esc 取消</span>
+          <canvas id="voice-waveform" aria-hidden="true"></canvas>
+        </div>
+        <button type="button" id="voice-mic" aria-label="开始语音输入" hidden>
+          <span class="sakura-morph-icon" aria-hidden="true"><span class="sakura-icon icon-mic"></span></span>
+        </button>
+        <button type="submit" id="composer-send" tabindex="-1" data-action="send" aria-label="发送消息">
+          <span class="sakura-morph-icon" aria-hidden="true"><span class="sakura-icon icon-send-horizontal"></span></span>
+        </button>
+      </form>
+
+      <div
+        id="composer-tool-dock"
+        class="composer-tool-dock"
+        data-interactive="true"
+        role="menu"
+        aria-label="扩展工具"
+        hidden
+      >
+        <div id="composer-tool-list" class="composer-tool-dock__list">
+          <button
+            type="button"
+            id="capture-screen"
+            class="composer-tool-dock__item"
+            data-tool-id="builtin.screen-capture"
+            role="menuitem"
+            tabindex="-1"
+          >
+            <span class="composer-tool-dock__icon" data-tool-icon="camera" aria-hidden="true">
+              <span class="sakura-icon icon-scan-line" aria-hidden="true"></span>
+            </span>
+            <span class="composer-tool-dock__copy">
+              <strong>截图</strong>
+            </span>
+          </button>
+        </div>
+      </div>
+
+      <figure id="portrait" class="portrait" data-drag-region="true" aria-label="当前角色，可拖动窗口">
+        <div id="visual-renderer" class="visual-renderer"></div>
+        <div id="portrait-fallback" class="portrait-fallback" hidden><strong id="portrait-fallback-name"></strong><span>角色表现暂不可用</span></div>
+      </figure>
+
+      <section id="acceptance-entry" class="acceptance-entry" data-interactive="true" hidden aria-hidden="true">
+        <button type="button" data-scenario="普通消息">normal</button>
+        <button type="button" data-scenario="/slow">slow</button>
+        <button type="button" data-scenario="/error">error</button>
+        <button type="button" data-scenario="/long">long</button>
+        <button type="button" data-scenario="/multi">multi</button>
+        <button type="button" data-scenario="/restart">restart</button>
+      </section>
+    </main>
+
+    <div id="pet-context-menu" class="pet-context-menu" role="menu" aria-label="桌宠菜单" hidden>
+      <span id="pet-context-menu-unavailable-reason" class="visually-hidden">
+        该功能尚未迁移到 Runtime v2
+      </span>
+      <button
+        type="button"
+        role="menuitem"
+        tabindex="-1"
+        data-menu-action="sakura.pet.visibility.toggle"
+        aria-disabled="false"
+      >
+        隐藏至托盘
+      </button>
+
+      <div class="pet-context-menu__separator" role="separator"></div>
+
+      <div class="pet-context-menu__language">
+        <button type="button" role="menuitem" tabindex="-1" data-menu-submenu
+          aria-haspopup="menu" aria-expanded="false" aria-controls="pet-language-menu">
+          <span>显示语言</span><span class="pet-context-menu__arrow" aria-hidden="true">›</span>
+        </button>
+        <div id="pet-language-menu" class="pet-context-menu__submenu" role="menu" aria-label="显示语言" hidden>
+          <button type="button" role="menuitemradio" tabindex="-1" aria-checked="false" data-menu-action="sakura.chat.subtitle.zh">
+            <span class="pet-context-menu__indicator" aria-hidden="true">✓</span><span>中文</span>
+          </button>
+          <button type="button" role="menuitemradio" tabindex="-1" aria-checked="false" data-menu-action="sakura.chat.subtitle.ja">
+            <span class="pet-context-menu__indicator" aria-hidden="true">✓</span><span>日文</span>
+          </button>
+          <button type="button" role="menuitemradio" tabindex="-1" aria-checked="false" data-menu-action="sakura.chat.subtitle.bilingual">
+            <span class="pet-context-menu__indicator" aria-hidden="true">✓</span><span>双语1</span>
+          </button>
+          <button type="button" role="menuitemradio" tabindex="-1" aria-checked="false" data-menu-action="sakura.chat.subtitle.bilingual_ja">
+            <span class="pet-context-menu__indicator" aria-hidden="true">✓</span><span>双语2</span>
+          </button>
+        </div>
+      </div>
+      <button
+        type="button"
+        role="menuitemcheckbox"
+        tabindex="-1"
+        aria-checked="false"
+        aria-disabled="false"
+        data-menu-action="sakura.pet.topmost.toggle"
+      >
+        <span class="pet-context-menu__indicator" aria-hidden="true">✓</span>
+        <span>保持置顶</span>
+      </button>
+
+      <div class="pet-context-menu__separator" role="separator"></div>
+
+      <button
+        type="button"
+        role="menuitem"
+        tabindex="-1"
+        aria-disabled="false"
+        data-menu-action="sakura.history.open"
+      >
+        聊天记录
+      </button>
+      <button
+        type="button"
+        role="menuitem"
+        tabindex="-1"
+        data-menu-action="sakura.runtime-log.open"
+        aria-disabled="false"
+      >
+        运行日志
+      </button>
+      <button
+        type="button"
+        role="menuitem"
+        tabindex="-1"
+        data-menu-action="sakura.settings.open"
+        aria-disabled="false"
+      >
+        设置
+      </button>
+
+      <div class="pet-context-menu__separator" role="separator"></div>
+
+      <button
+        type="button"
+        role="menuitem"
+        tabindex="-1"
+        data-menu-action="sakura.app.exit"
+        aria-disabled="false"
+      >
+        退出
+      </button>
+    </div>
+  </body>
+</html>

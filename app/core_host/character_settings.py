@@ -1,0 +1,629 @@
+"""Qt-free Runtime v2 character installation and selection boundary."""
+
+from __future__ import annotations
+
+import hmac
+import shutil
+import threading
+from collections.abc import Mapping
+from contextlib import nullcontext
+from pathlib import Path
+from typing import Any, Callable
+
+from app.config.character_archive import (
+    CharacterArchiveError,
+    export_character_archive,
+    export_character_voice_archive,
+    import_character_archive,
+    import_character_voice_archive,
+)
+from app.config.character_loader import (
+    CharacterConfigError,
+    CharacterProfile,
+    CharacterRegistry,
+)
+from app.config.character_packages import remove_character_installation
+from app.config.settings_service import AppSettingsService
+from app.core.diagnostics import exception_diagnostics
+from app.core.runtime_log import log_event
+from app.core_host.protocol import response
+from app.core_host.real_chat import RealChatRejection
+
+CHARACTER_SETTINGS_REQUEST_NAMES = frozenset(
+    {
+        "characters.settings.get",
+        "characters.settings.import",
+        "characters.settings.import_voice",
+        "characters.settings.export",
+        "characters.settings.select",
+        "characters.settings.delete",
+        "characters.visuals.get",
+    }
+)
+
+
+class CharacterSettingsError(ValueError):
+    def __init__(self, code: str, message: str, *, field: str = "") -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.field = field
+
+    def public_error(self) -> dict[str, object]:
+        return {
+            "code": self.code,
+            "message": self.message,
+            "retryable": self.code == "CHARACTER_CONFIG_SAVE_FAILED",
+            "details": {"feature": "character.manage", "field": self.field},
+        }
+
+
+class CharacterSettingsBoundary:
+    def __init__(
+        self,
+        generation_id: str,
+        generation_credential: str,
+        user_root: Path,
+        *,
+        plugin_application_provider: Callable[[], object | None] = lambda: None,
+        prepare_voice_update: Callable | None = None,
+        apply_current: Callable[[], None] | None = None,
+        prepare_switch: Callable | None = None,
+        apply_switch: Callable[[], None] | None = None,
+    ) -> None:
+        self._generation_id = generation_id
+        self._generation_credential = generation_credential
+        self._user_root = Path(user_root)
+        self._settings = AppSettingsService(self._user_root)
+        self._revision = 1
+        self._lock = threading.Lock()
+        self._plugin_application_provider = plugin_application_provider
+        self._prepare_voice_update = prepare_voice_update
+        self._apply_current = apply_current
+        self._prepare_switch = prepare_switch
+        self._apply_switch = apply_switch
+        self._switch_apply_pending = False
+        self._visual_apply_pending: set[str] = set()
+
+    def handle(self, request: dict[str, Any]) -> dict[str, Any]:
+        supplied = request.get("generationCredential")
+        if (
+            request.get("generationId") != self._generation_id
+            or not isinstance(supplied, str)
+            or not hmac.compare_digest(supplied, self._generation_credential)
+        ):
+            raise RuntimeError("GENERATION_IDENTITY_MISMATCH")
+        try:
+            name = request.get("name")
+            payload = request.get("payload")
+            if not isinstance(payload, Mapping):
+                raise CharacterSettingsError(
+                    "INVALID_REQUEST", "角色设置请求格式无效。"
+                )
+            if name == "characters.settings.get":
+                if payload:
+                    raise CharacterSettingsError(
+                        "INVALID_REQUEST", "角色设置读取请求必须为空。"
+                    )
+                result = self.snapshot()
+            elif name == "characters.settings.import":
+                if set(payload) != {"path"}:
+                    raise CharacterSettingsError(
+                        "INVALID_REQUEST", "角色导入请求格式无效。"
+                    )
+                result = self.import_archive(payload["path"])
+            elif name == "characters.settings.import_voice":
+                if set(payload) != {"path", "characterId"}:
+                    raise CharacterSettingsError(
+                        "INVALID_REQUEST", "语音包导入请求格式无效。"
+                    )
+                result = self.import_voice_archive(
+                    payload["path"], payload["characterId"]
+                )
+            elif name == "characters.settings.export":
+                if set(payload) != {"path", "characterId", "kind"}:
+                    raise CharacterSettingsError(
+                        "INVALID_REQUEST", "角色包导出请求格式无效。"
+                    )
+                result = self.export_archive(
+                    payload["path"],
+                    payload["characterId"],
+                    payload["kind"],
+                )
+            elif name == "characters.settings.select":
+                if "characterId" not in payload or set(payload) - {"characterId", "visualSelections"}:
+                    raise CharacterSettingsError(
+                        "INVALID_REQUEST", "角色选择请求格式无效。"
+                    )
+                result = self.select(payload["characterId"], payload.get("visualSelections", {}))
+            elif name == "characters.settings.delete":
+                if set(payload) != {"characterId"}:
+                    raise CharacterSettingsError(
+                        "INVALID_REQUEST", "角色删除请求格式无效。"
+                    )
+                result = self.delete_archive(payload["characterId"])
+            elif name == "characters.visuals.get":
+                if set(payload) != {"characterId"}:
+                    raise CharacterSettingsError("INVALID_REQUEST", "角色形态读取请求格式无效。")
+                result = self.visual_snapshot(payload["characterId"])
+            else:
+                raise CharacterSettingsError(
+                    "UNKNOWN_COMMAND", "不支持的角色设置命令。"
+                )
+            return response(
+                request,
+                generation_id=self._generation_id,
+                generation_credential=self._generation_credential,
+                protocol_minor=2,
+                payload=result,
+            )
+        except CharacterSettingsError as error:
+            return response(
+                request,
+                generation_id=self._generation_id,
+                generation_credential=self._generation_credential,
+                protocol_minor=2,
+                error=error.public_error(),
+            )
+
+    def snapshot(self) -> dict[str, object]:
+        registry = CharacterRegistry(self._user_root)
+        current = self._settings.load_current_character_id(registry)
+        return {
+            "schemaVersion": 1,
+            "revision": self._revision,
+            "currentCharacterId": current,
+            "characters": [
+                {
+                    "id": profile.id,
+                    "displayName": profile.display_name,
+                    "hasVoice": profile.voice is not None,
+                    "hasExportableVoice": self._has_exportable_voice(profile),
+                }
+                for profile in registry.all()
+            ],
+        }
+
+    def import_archive(self, raw_path: object) -> dict[str, object]:
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            raise CharacterSettingsError(
+                "CHARACTER_ARCHIVE_PATH_INVALID",
+                "请选择有效的 Sakura .char 角色包。",
+                field="path",
+            )
+        archive = Path(raw_path).expanduser()
+        if not archive.is_absolute() or archive.suffix.lower() != ".char":
+            raise CharacterSettingsError(
+                "CHARACTER_ARCHIVE_PATH_INVALID",
+                "请选择有效的 Sakura .char 角色包。",
+                field="path",
+            )
+        with self._lock:
+            before = CharacterRegistry(self._user_root)
+            current = self._settings.load_current_character_id(before)
+            change_plan = "unchanged"
+            try:
+                imported = import_character_archive(archive, self._user_root)
+                if current is None:
+                    self._settings.save_current_character_id(
+                        CharacterRegistry(self._user_root), imported.character_id
+                    )
+                    change_plan = "core_restart_required"
+            except (
+                OSError,
+                CharacterArchiveError,
+                CharacterConfigError,
+                ValueError,
+            ) as error:
+                raise CharacterSettingsError(
+                    "CHARACTER_IMPORT_FAILED",
+                    "角色包导入失败，现有角色保持不变。",
+                ) from error
+            self._revision += 1
+            result = self._change_result(change_plan)
+            result["pluginRequirements"] = self._package_requirements(imported.package_dir)
+            return result
+
+    def import_voice_archive(
+        self,
+        raw_path: object,
+        raw_character_id: object,
+    ) -> dict[str, object]:
+        archive = self._import_archive_path(raw_path, suffix=".voice")
+        character_id = self._character_id(raw_character_id)
+        with self._lock:
+            registry = CharacterRegistry(self._user_root)
+            try:
+                registry.get(character_id)
+            except CharacterConfigError as error:
+                raise CharacterSettingsError(
+                    "CHARACTER_NOT_FOUND",
+                    "选择的角色不存在。",
+                    field="characterId",
+                ) from error
+            current = self._settings.load_current_character_id(registry)
+            try:
+                scope = (
+                    self._prepare_voice_update()
+                    if current == character_id and self._prepare_voice_update
+                    else nullcontext()
+                )
+                with scope as runtime_errors:
+                    import_character_voice_archive(archive, self._user_root, character_id)
+            except (
+                OSError,
+                CharacterArchiveError,
+                CharacterConfigError,
+                ValueError,
+            ) as error:
+                raise CharacterSettingsError(
+                    "CHARACTER_VOICE_IMPORT_FAILED",
+                    "语音包导入失败。请检查语音包和当前角色的语音文件。",
+                    field="path",
+                ) from error
+            self._revision += 1
+            try:
+                if runtime_errors:
+                    raise runtime_errors[0]
+                if current == character_id and self._apply_current is not None:
+                    self._apply_current()
+            except Exception as error:
+                log_event("CharacterSettings", "语音包已导入，运行态更新失败", exception_diagnostics(
+                    error, reason_code="CHARACTER_VOICE_APPLY_FAILED", stage="character.voice.apply"), severity="error")
+                raise CharacterSettingsError(
+                    "CHARACTER_VOICE_APPLY_FAILED",
+                    "语音包已导入，但运行态更新失败，请查看插件运行日志。",
+                ) from error
+            result = self._change_result(
+                "character_refresh" if current == character_id else "unchanged"
+            )
+            result["pluginRequirements"] = [item for item in self._package_requirements(registry.get(character_id).package_dir) if item["kind"] == "tts"]
+            return result
+
+    def _package_requirements(self, package_dir: Path) -> list[dict]:
+        import json
+        from app.config.plugin_requirements import requirements_for_manifest, check_requirements
+        application = self._plugin_application_provider()
+        if application is None:
+            return []
+        manifest = json.loads((package_dir / "character.json").read_text(encoding="utf-8"))
+        return check_requirements(requirements_for_manifest(manifest), application.inventory().records)
+
+    def export_archive(
+        self,
+        raw_path: object,
+        raw_character_id: object,
+        raw_kind: object,
+    ) -> dict[str, object]:
+        if not isinstance(raw_kind, str) or raw_kind not in {"full", "card", "voice"}:
+            raise CharacterSettingsError(
+                "CHARACTER_ARCHIVE_KIND_INVALID",
+                "请选择有效的角色包导出类型。",
+                field="kind",
+            )
+        suffix = ".voice" if raw_kind == "voice" else ".char"
+        output = self._export_archive_path(raw_path, suffix=suffix)
+        character_id = self._character_id(raw_character_id)
+        if not output.parent.is_dir():
+            raise CharacterSettingsError(
+                "CHARACTER_ARCHIVE_PATH_INVALID",
+                "请选择有效的导出目录。",
+                field="path",
+            )
+        with self._lock:
+            try:
+                profile = CharacterRegistry(self._user_root).get(character_id)
+            except CharacterConfigError as error:
+                raise CharacterSettingsError(
+                    "CHARACTER_NOT_FOUND",
+                    "选择的角色不存在。",
+                    field="characterId",
+                ) from error
+            if raw_kind in {"full", "voice"} and not self._has_exportable_voice(
+                profile
+            ):
+                message = (
+                    "当前角色没有完整语音模型，请导出单角色包。"
+                    if raw_kind == "full"
+                    else "当前角色没有可导出的语音模型。"
+                )
+                raise CharacterSettingsError(
+                    "CHARACTER_VOICE_NOT_EXPORTABLE",
+                    message,
+                    field="kind",
+                )
+            try:
+                if raw_kind == "voice":
+                    export_character_voice_archive(profile, output)
+                else:
+                    export_character_archive(
+                        profile,
+                        output,
+                        include_voice=raw_kind == "full",
+                    )
+            except (
+                OSError,
+                CharacterArchiveError,
+                CharacterConfigError,
+                ValueError,
+            ) as error:
+                raise CharacterSettingsError(
+                    "CHARACTER_EXPORT_FAILED",
+                    "角色包导出失败，目标文件未被替换。",
+                    field="path",
+                ) from error
+        return {
+            "schemaVersion": 1,
+            "outputPath": str(output),
+            "message": f"角色包已导出到：{output}",
+        }
+
+    def delete_archive(self, raw_character_id: object) -> dict[str, object]:
+        character_id = self._character_id(raw_character_id)
+        with self._lock:
+            registry = CharacterRegistry(self._user_root)
+            try:
+                profile = registry.get(character_id)
+            except CharacterConfigError as error:
+                raise CharacterSettingsError(
+                    "CHARACTER_NOT_FOUND",
+                    "选择的角色不存在。",
+                    field="characterId",
+                ) from error
+            current = self._settings.load_current_character_id(registry)
+            try:
+                remove_character_installation(registry.characters_dir, profile.package_dir)
+            except (OSError, ValueError) as error:
+                raise CharacterSettingsError(
+                    "CHARACTER_DELETE_FAILED",
+                    "角色包删除失败，现有角色保持不变。",
+                    field="characterId",
+                ) from error
+            remaining = CharacterRegistry(self._user_root)
+            remaining_profiles = remaining.all()
+            next_character_id = None
+            if current == character_id:
+                next_character_id = (
+                    remaining_profiles[0].id if remaining_profiles else None
+                )
+                change_plan = "core_restart_required"
+            elif not remaining_profiles:
+                change_plan = "core_restart_required"
+            else:
+                change_plan = "unchanged"
+            try:
+                self._settings.forget_character(
+                    remaining, character_id, next_character_id
+                )
+            except (OSError, ValueError, CharacterConfigError) as error:
+                raise CharacterSettingsError(
+                    "CHARACTER_CONFIG_SAVE_FAILED",
+                    "角色选择保存失败，原配置保持不变。",
+                    field="characterId",
+                ) from error
+            self._discard_studio_workspace(character_id)
+            self._revision += 1
+            return self._change_result(change_plan)
+
+    def visual_snapshot(self, raw_character_id: object) -> dict[str, object]:
+        character_id = self._character_id(raw_character_id)
+        try:
+            profile = CharacterRegistry(self._user_root).get(character_id)
+        except CharacterConfigError as error:
+            raise CharacterSettingsError("CHARACTER_NOT_FOUND", "选择的角色不存在。") from error
+        application = self._plugin_application_provider()
+        host = application.visuals if application is not None else None
+        choices = [host.resource_choice(resource, profile.visual_providers.get(resource.id)) if host else {
+            "id": resource.id, "name": resource.name or "未命名形态", "providerId": None,
+            "installId": None, "reasonCode": "VISUAL_SERVICE_UNAVAILABLE"
+        } for resource in profile.visual_resources]
+        preference = self._settings.load_visual_selections().get(character_id)
+        if preference not in {item.id for item in profile.visual_resources}:
+            preference = None
+        return {"schemaVersion": 1, "characterId": character_id, "defaultResourceId": profile.default_visual_id,
+            "preferenceResourceId": preference, "resources": choices}
+
+    def select_visual_resource(self, target: dict, resource_id: str, *, expected_visual_activity=None) -> dict:
+        try:
+            result = self.select(target.get("characterId"), {target.get("characterId"): resource_id},
+                                 expected_visual_target=target, expected_visual_activity=expected_visual_activity)
+        except CharacterSettingsError as error:
+            if error.code != "VISUAL_SELECTION_APPLY_FAILED":
+                raise
+            return {"accepted": False, "saved": True, "reasonCode": error.code}
+        return {"accepted": True, "changePlan": result["changePlan"]}
+
+    def select(self, raw_character_id: object, visual_selections: object = None,
+               *, expected_visual_target: dict | None = None, expected_visual_activity=None) -> dict[str, object]:
+        if not isinstance(raw_character_id, str) or not raw_character_id.strip():
+            raise CharacterSettingsError(
+                "CHARACTER_ID_INVALID",
+                "角色标识无效。",
+                field="characterId",
+            )
+        character_id = raw_character_id.strip()
+        if visual_selections is None:
+            visual_selections = {}
+        if not isinstance(visual_selections, dict) or any(
+            not isinstance(key, str) or (value is not None and not isinstance(value, str))
+            for key, value in visual_selections.items()
+        ):
+            raise CharacterSettingsError("VISUAL_SELECTION_INVALID", "显示方式选择无效。")
+        with self._lock:
+            registry = CharacterRegistry(self._user_root)
+            try:
+                registry.get(character_id)
+                current = self._settings.load_current_character_id(registry)
+                preferences = self._settings.load_visual_selections()
+                changed = {key: value for key, value in visual_selections.items() if preferences.get(key) != value}
+                reapply_visual = character_id in self._visual_apply_pending and character_id in visual_selections
+                application = self._plugin_application_provider()
+                if expected_visual_target is not None:
+                    if current != character_id or application is None:
+                        raise CharacterSettingsError("VISUAL_BINDING_EXPIRED", "角色表现已变化。")
+                    application.commit_visual_selection(expected_visual_target, lambda: None,
+                                                        expected_activity=expected_visual_activity)
+                validated = {**changed, **({character_id: visual_selections[character_id]} if reapply_visual else {})}
+                for target, resource_id in validated.items():
+                    profile = registry.get(target)
+                    resource = next((item for item in profile.visual_resources if item.id == (resource_id or profile.default_visual_id)), None)
+                    if resource_id is not None and resource is None:
+                        raise CharacterSettingsError("VISUAL_RESOURCE_NOT_FOUND", "所选形态已被移除，请重新选择。")
+                    if resource is not None:
+                        from app.core_host.visual_host import VisualHostError
+                        if application is None:
+                            raise CharacterSettingsError("VISUAL_SERVICE_UNAVAILABLE", "表现插件暂不可用，请稍后重试。")
+                        try:
+                            application.validate_visual_choice(profile, resource)
+                        except VisualHostError as error:
+                            raise CharacterSettingsError(error.code, "所选形态无法使用，请检查对应插件或选择其他形态。") from error
+                needs_switch = current != character_id or self._switch_apply_pending
+                if not needs_switch and not changed and not reapply_visual:
+                    return self._change_result("unchanged")
+                if needs_switch and self._apply_switch is not None:
+                    scope = self._prepare_switch() if self._prepare_switch else nullcontext()
+                    committed = False
+                    try:
+                        with scope:
+                            self._settings.save_character_selection(registry, character_id, changed)
+                            committed = True
+                            self._switch_apply_pending = True
+                            self._apply_switch()
+                        self._switch_apply_pending = False
+                    except Exception as error:
+                        log_event("CharacterSettings", "角色切换未完成", exception_diagnostics(
+                            error, reason_code="CHARACTER_SWITCH_FAILED", stage="character.switch"), severity="error")
+                        raise CharacterSettingsError(
+                            "CHARACTER_SWITCH_APPLY_FAILED" if committed else "CHARACTER_SWITCH_PREPARE_FAILED",
+                            "角色选择已保存，但切换未能完成，请查看运行日志。" if committed else "旧角色任务尚未结束，角色未切换。",
+                        ) from error
+                else:
+                    save = lambda: self._settings.save_character_selection(registry, character_id, changed)
+                    if expected_visual_target is not None:
+                        application.commit_visual_selection(expected_visual_target, save,
+                                                            expected_activity=expected_visual_activity)
+                    else:
+                        save()
+            except (CharacterSettingsError, RealChatRejection):
+                raise
+            except CharacterConfigError as error:
+                raise CharacterSettingsError(
+                    "CHARACTER_NOT_FOUND",
+                    "选择的角色不存在。",
+                    field="characterId",
+                ) from error
+            except (OSError, ValueError) as error:
+                raise CharacterSettingsError(
+                    "CHARACTER_CONFIG_SAVE_FAILED",
+                    "角色选择保存失败，原配置保持不变。",
+                    field="characterId",
+                ) from error
+            self._revision += 1
+            if needs_switch:
+                return self._change_result("character_switch" if self._apply_switch else "core_restart_required")
+            if character_id in changed or reapply_visual:
+                # The Assistant and other plugins belong to the character session.
+                # Changing its presentation only replaces the visual binding; old
+                # replies retain their expired binding and cannot control the new one.
+                try:
+                    application.bind_character_presentation(character_id)
+                except Exception as error:
+                    self._visual_apply_pending.add(character_id)
+                    raise CharacterSettingsError("VISUAL_SELECTION_APPLY_FAILED",
+                        "形态选择已保存，但尚未应用，请重新选择或重新加载角色。") from error
+                self._visual_apply_pending.discard(character_id)
+                return self._change_result("visual_rebind")
+            return self._change_result("unchanged")
+
+    def _change_result(self, change_plan: str) -> dict[str, object]:
+        if change_plan not in {"unchanged", "core_restart_required", "visual_rebind", "character_refresh", "character_switch"}:
+            raise ValueError("invalid character change plan")
+        return {
+            "schemaVersion": 1,
+            "snapshot": self.snapshot(),
+            "changePlan": change_plan,
+        }
+
+    def _discard_studio_workspace(self, character_id: str) -> None:
+        from app.storage.paths import StoragePaths, sanitize_directory_component
+
+        drafts = StoragePaths(self._user_root).character_studio_drafts_dir
+        try:
+            if not drafts.is_dir():
+                return
+            root = drafts.resolve()
+            candidate = drafts / sanitize_directory_component(character_id)
+            if candidate.is_symlink():
+                return
+            target = candidate.resolve(strict=False)
+            if target == root or target.parent != root or not target.is_dir():
+                return
+            shutil.rmtree(target, ignore_errors=True)
+        except OSError:
+            return
+
+    @staticmethod
+    def _character_id(raw_character_id: object) -> str:
+        if not isinstance(raw_character_id, str) or not raw_character_id.strip():
+            raise CharacterSettingsError(
+                "CHARACTER_ID_INVALID",
+                "角色标识无效。",
+                field="characterId",
+            )
+        return raw_character_id.strip()
+
+    @staticmethod
+    def _import_archive_path(raw_path: object, *, suffix: str) -> Path:
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            raise CharacterSettingsError(
+                "CHARACTER_ARCHIVE_PATH_INVALID",
+                f"请选择有效的 Sakura {suffix} 文件用于导入。",
+                field="path",
+            )
+        path = Path(raw_path).expanduser()
+        if (
+            not path.is_absolute()
+            or path.suffix.lower() != suffix
+            or not path.is_file()
+        ):
+            raise CharacterSettingsError(
+                "CHARACTER_ARCHIVE_PATH_INVALID",
+                f"请选择有效的 Sakura {suffix} 文件用于导入。",
+                field="path",
+            )
+        return path
+
+    @staticmethod
+    def _export_archive_path(raw_path: object, *, suffix: str) -> Path:
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            raise CharacterSettingsError(
+                "CHARACTER_ARCHIVE_PATH_INVALID",
+                "请选择有效的角色包导出路径。",
+                field="path",
+            )
+        path = Path(raw_path).expanduser()
+        if not path.is_absolute():
+            raise CharacterSettingsError(
+                "CHARACTER_ARCHIVE_PATH_INVALID",
+                "请选择有效的角色包导出路径。",
+                field="path",
+            )
+        return path if path.suffix.lower() == suffix else path.with_suffix(suffix)
+
+    @staticmethod
+    def _has_exportable_voice(profile: CharacterProfile) -> bool:
+        voice = profile.voice
+        return bool(
+            voice is not None
+            and voice.gpt_model_path is not None
+            and voice.gpt_model_path.is_file()
+            and voice.sovits_model_path is not None
+            and voice.sovits_model_path.is_file()
+        )
+
+
+__all__ = [
+    "CHARACTER_SETTINGS_REQUEST_NAMES",
+    "CharacterSettingsBoundary",
+    "CharacterSettingsError",
+]

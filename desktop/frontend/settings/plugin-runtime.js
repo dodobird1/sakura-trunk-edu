@@ -1,0 +1,330 @@
+const SNAPSHOT_KEYS = ["schemaVersion", "revision", "state", "reasonCode", "plugins", "windowGeneration", "coreGenerationId"];
+
+function clone(value) { return structuredClone(value); }
+
+function isObject(value) {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+export function validatePluginSnapshot(input) { return Object.freeze(clone(input)); }
+
+function validateManagementSnapshot(input) { return validatePluginSnapshot(input); }
+
+function transitionError(error) {
+  const message = String(error?.message || error || "");
+  return ["SETTINGS_CORE_GENERATION_MISMATCH", "SETTINGS_CORE_UNAVAILABLE", "CORE_RESTART", "CORE_GENERATION"]
+    .some((code) => message.includes(code));
+}
+
+function uncertainManagementError(error) {
+  const message = String(error?.message || error || "");
+  return transitionError(error) || [
+    "CONFIG_REVISION_CONFLICT", "REQUEST_DEADLINE_EXCEEDED", "SETTINGS_REQUEST_ABORTED",
+    "TRANSPORT_", "PLUGIN_INSTALL_ROLLBACK_FAILED", "PLUGIN_INSTALL_RECOVERY_FAILED",
+    "PLUGIN_UNINSTALL_ROLLBACK_FAILED", "PLUGIN_UNINSTALL_RECOVERY_FAILED",
+    "PLUGIN_UNINSTALL_CLEANUP_FAILED",
+  ].some((code) => message.includes(code));
+}
+
+function editableValues(current, pluginId, sectionId, values) {
+  const plugin = current?.plugins.find((item) => item.pluginId === pluginId);
+  const section = plugin?.sections.find((item) => item.sectionId === sectionId);
+  if (!section) throw new Error("PLUGIN_SETTINGS_SECTION_INVALID");
+  const fields = new Map(section.fields.map((field) => [field.key, field]));
+  const projected = {};
+  for (const [key, value] of Object.entries(values)) {
+    const field = fields.get(key);
+    if (!field) throw new Error("PLUGIN_SETTINGS_VALUES_INVALID");
+    if (!field.readonly && !["readonly", "status", "resource"].includes(field.type)) projected[key] = value;
+  }
+  return projected;
+}
+
+function editableDraft(current, draft) {
+  const projected = { enabledById: clone(draft.enabledById || {}), settingsById: {} };
+  for (const [pluginId, sections] of Object.entries(draft.settingsById || {})) {
+    for (const [sectionId, values] of Object.entries(sections || {})) {
+      const editable = editableValues(current, pluginId, sectionId, values || {});
+      if (Object.keys(editable).length) {
+        projected.settingsById[pluginId] ||= {};
+        projected.settingsById[pluginId][sectionId] = editable;
+      }
+    }
+  }
+  return projected;
+}
+
+function collectionDescriptor(current, pluginId, sectionId, collectionId) {
+  const plugin = current?.plugins.find((item) => item.pluginId === pluginId);
+  const section = plugin?.sections.find((item) => item.sectionId === sectionId);
+  const collection = section?.collections.find((item) => item.collectionId === collectionId);
+  if (!collection) throw new Error("PLUGIN_COLLECTION_INVALID");
+  return collection;
+}
+
+function collectionRequest(current, input) {
+  const { operation, pluginId, sectionId, collectionId } = input;
+  const collection = collectionDescriptor(current, pluginId, sectionId, collectionId);
+  let payload;
+  if (operation === "query") {
+    const cursor = input.cursor ?? null;
+    const limit = input.limit ?? collection.pageSize;
+    const search = input.search ?? "";
+    const filters = input.filters ?? {};
+    const filterSpecs = new Map(collection.filters.map((item) => [item.key, item]));
+    if ((cursor !== null && (typeof cursor !== "string"))
+        || !Number.isSafeInteger(limit) || limit < 1 || limit > 100
+        || typeof search !== "string" || (search && !collection.searchable)
+        || !filters || typeof filters !== "object" || Array.isArray(filters)
+        || Object.entries(filters).some(([key, value]) => !filterSpecs.get(key)?.options
+          .some((option) => option.value === value))) {
+      throw new Error("PLUGIN_COLLECTION_REQUEST_INVALID");
+    }
+    payload = { cursor, limit, search, filters: clone(filters) };
+  } else if (["create", "update"].includes(operation)) {
+    if (operation === "create" && !collection.canCreate) throw new Error("PLUGIN_COLLECTION_OPERATION_UNAVAILABLE");
+    if (operation === "update" && !collection.canUpdate) throw new Error("PLUGIN_COLLECTION_OPERATION_UNAVAILABLE");
+    const values = input.values;
+    const fields = new Map(collection.fields.map((field) => [field.key, field]));
+    if (!values || typeof values !== "object" || Array.isArray(values)
+        || Object.keys(values).some((key) => !fields.has(key) || fields.get(key).readonly)) {
+      throw new Error("PLUGIN_COLLECTION_REQUEST_INVALID");
+    }
+    payload = { values: clone(values) };
+    if (operation === "update") {
+      if (typeof input.itemId !== "string" || !input.itemId) {
+        throw new Error("PLUGIN_COLLECTION_REQUEST_INVALID");
+      }
+      payload = { itemId: input.itemId, ...payload };
+    }
+  } else if (operation === "delete") {
+    if (!collection.canDelete || typeof input.itemId !== "string" || !input.itemId
+       ) throw new Error("PLUGIN_COLLECTION_OPERATION_UNAVAILABLE");
+    payload = { itemId: input.itemId };
+  } else {
+    throw new Error("PLUGIN_COLLECTION_REQUEST_INVALID");
+  }
+  return { operation, pluginId, sectionId, collectionId, payload };
+}
+
+function validateCollectionResult(_operation, result) { return clone(result); }
+
+export function createPluginController({ invoke, applySnapshot, readDraft, onDirty, onSectionSaved = () => {}, onSectionFailed = () => {},
+  wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)) }) {
+  let current = null;
+  let disposed = false;
+  let rebindPromise = null;
+  let refreshPromise = null;
+
+  function initialize(input, { preserveDraft = false, keepGlobalCollectionDrafts = false } = {}) {
+    const preserved = preserveDraft && current ? clone(readDraft()) : null;
+    current = validatePluginSnapshot(input);
+    applySnapshot(current, { preserveDraft, draft: preserved, keepGlobalCollectionDrafts });
+    onDirty();
+  }
+
+  async function bindCurrent({ preserveDraft, keepGlobalCollectionDrafts = false }) {
+    if (rebindPromise) return rebindPromise;
+    const deadline = Date.now() + 10_000;
+    rebindPromise = (async () => {
+      if (refreshPromise) {
+        try { await refreshPromise; } catch { /* the bounded rebind below owns recovery */ }
+      }
+      let lastError = null;
+      while (!disposed && Date.now() < deadline) {
+        try {
+          const next = validatePluginSnapshot(await invoke("settings_plugins_get"));
+          if (!current || JSON.stringify(next) !== JSON.stringify(current)) {
+            initialize(next, { preserveDraft, keepGlobalCollectionDrafts });
+          }
+          return next;
+        } catch (error) { lastError = error; }
+        await wait(100);
+      }
+      throw new Error(`PLUGIN_SETTINGS_REFRESH_NOT_READY${lastError ? `: ${String(lastError)}` : ""}`);
+    })().finally(() => { rebindPromise = null; });
+    return rebindPromise;
+  }
+
+  async function refreshCurrent() {
+    if (rebindPromise) return rebindPromise;
+    if (refreshPromise) return refreshPromise;
+    const previous = current;
+    refreshPromise = (async () => {
+      const next = validatePluginSnapshot(await invoke("settings_plugins_get"));
+      // A read started before a save must not replace its committed snapshot.
+      if (!disposed && current === previous && (!current || JSON.stringify(next) !== JSON.stringify(current))) {
+        initialize(next, { preserveDraft: true });
+      }
+      return next;
+    })().finally(() => { refreshPromise = null; });
+    return refreshPromise;
+  }
+
+  return Object.freeze({
+    initialize,
+    snapshot: () => current,
+    draft: () => clone(readDraft()),
+    isDirty() {
+      return Boolean(current && JSON.stringify(readDraft()) !== JSON.stringify({ enabledById: {}, settingsById: {} }));
+    },
+    async save({ keepGlobalCollectionDrafts = false } = {}) {
+      if (!current) throw new Error("Plugin settings are not initialized");
+      const settings = editableDraft(current, clone(readDraft()));
+      const previousGeneration = current.coreGenerationId;
+      let hasDetailedSettings = false;
+      const savedSections = [];
+      let savingSection = "";
+      let enableResultPending = false;
+      try {
+        for (const [pluginId, enabled] of Object.entries(settings.enabledById)) {
+          const plugin = current.plugins.find((item) => item.pluginId === pluginId);
+          if (!plugin) throw new Error("PLUGIN_ENABLED_REQUEST_INVALID");
+          enableResultPending = true;
+          const result = validateManagementSnapshot(await invoke("settings_plugins_enabled_set", {
+            windowGeneration: current.windowGeneration,
+            coreGenerationId: previousGeneration,
+            revision: current.revision,
+            installId: plugin.installId,
+            enabled,
+          }));
+          if (result.managementAction !== "enabled_changed" || result.installId !== plugin.installId
+              || result.pluginId !== pluginId) throw new Error("PLUGIN_MANAGEMENT_RESPONSE_INVALID");
+          current = Object.freeze(Object.fromEntries(SNAPSHOT_KEYS.map((key) => [key, result[key]])));
+          enableResultPending = false;
+          if (result.applicationState === "error") {
+            initialize(current, { preserveDraft: true });
+            const error = new Error(`开关已保存，但${plugin.name}${enabled ? "启动" : "停止"}失败。请查看插件状态。`);
+            error.code = result.applicationReasonCode;
+            throw error;
+          }
+        }
+        for (const [pluginId, sections] of Object.entries(settings.settingsById)) {
+          for (const [sectionId, values] of Object.entries(sections)) {
+            hasDetailedSettings = true;
+            savingSection = `${pluginId}/${sectionId}`;
+            const result = await invoke("settings_plugins_save", {
+              windowGeneration: current.windowGeneration,
+              coreGenerationId: previousGeneration,
+              pluginId,
+              sectionId,
+              values,
+            });
+            if (result?.saved !== true || result.pluginId !== pluginId || result.sectionId !== sectionId
+                || result.changePlan !== "applied" || result.applicationState !== "applied"
+                || result.applicationReasonCode !== "READY") {
+              throw new Error("PLUGIN_SETTINGS_CHANGE_PLAN_INVALID");
+            }
+            onSectionSaved(pluginId, sectionId, values);
+            savedSections.push(savingSection);
+          }
+        }
+        let next;
+        if (hasDetailedSettings) {
+          next = await bindCurrent({ preserveDraft: false, keepGlobalCollectionDrafts });
+        } else {
+          next = current;
+          initialize(next, { preserveDraft: false, keepGlobalCollectionDrafts });
+        }
+        return Object.freeze({
+          ...next,
+          changePlan: "applied",
+          applicationState: "applied",
+          applicationReasonCode: "READY",
+        });
+      } catch (error) {
+        if (savingSection && !savedSections.includes(savingSection)) {
+          const [pluginId, sectionId] = savingSection.split("/"); onSectionFailed(pluginId, sectionId);
+        }
+        if (hasDetailedSettings || enableResultPending || uncertainManagementError(error)) {
+          // The desired state may already be saved even when the reply is lost.
+          try { await bindCurrent({ preserveDraft: true }); } catch { /* keep the original save error */ }
+        }
+        if (savedSections.length) throw new Error(`已保存 ${savedSections.length} 个设置区块；${savingSection} 未完成，修改已保留。${String(error.message || error)}`);
+        throw error;
+      }
+    },
+    async action({ pluginId, sectionId, actionId, values }) {
+      if (!current) throw new Error("Plugin settings are not initialized");
+      const result = await invoke("settings_plugins_action", {
+        windowGeneration: current.windowGeneration, coreGenerationId: current.coreGenerationId,
+        pluginId, sectionId, actionId, values: editableValues(current, pluginId, sectionId, clone(values)),
+      });
+      if (actionId === "sakura.reload") {
+        await bindCurrent({ preserveDraft: true });
+      }
+      return clone(result);
+    },
+    async install(sourceKind) {
+      if (!current || !["zip", "folder"].includes(sourceKind)) {
+        throw new Error("PLUGIN_INSTALL_REQUEST_INVALID");
+      }
+      try {
+        const result = await invoke("settings_plugins_install", {
+          windowGeneration: current.windowGeneration,
+          coreGenerationId: current.coreGenerationId,
+          revision: current.revision,
+          sourceKind,
+        });
+        if (result.cancelled === true) return null;
+        const next = validateManagementSnapshot(result);
+        if (next.managementAction !== "installed"
+            || !next.plugins.some((plugin) => plugin.installId === next.installId
+              && plugin.pluginId === next.pluginId
+              && plugin.source === "user" && plugin.canUninstall && !plugin.enabled)) {
+          throw new Error("PLUGIN_MANAGEMENT_RESPONSE_INVALID");
+        }
+        initialize(Object.fromEntries(SNAPSHOT_KEYS.map((key) => [key, next[key]])), {
+          preserveDraft: true,
+        });
+        return next;
+      } catch (error) {
+        if (uncertainManagementError(error)) {
+          try { await bindCurrent({ preserveDraft: true }); } catch { /* keep the management error */ }
+        }
+        throw error;
+      }
+    },
+    async uninstall(installId) {
+      const plugin = current?.plugins.find((item) => item.installId === installId);
+      if (!current || !plugin?.canUninstall
+          || plugin.source !== "user") {
+        throw new Error("PLUGIN_UNINSTALL_REQUEST_INVALID");
+      }
+      try {
+        const result = validateManagementSnapshot(await invoke("settings_plugins_uninstall", {
+          windowGeneration: current.windowGeneration,
+          coreGenerationId: current.coreGenerationId,
+          revision: current.revision,
+          installId,
+        }));
+        if (result.managementAction !== "uninstalled" || result.installId !== installId
+            || result.plugins.some((item) => item.installId === installId)) {
+          throw new Error("PLUGIN_MANAGEMENT_RESPONSE_INVALID");
+        }
+        initialize(Object.fromEntries(SNAPSHOT_KEYS.map((key) => [key, result[key]])), {
+          preserveDraft: true,
+        });
+        return result;
+      } catch (error) {
+        if (uncertainManagementError(error)) {
+          try { await bindCurrent({ preserveDraft: true }); } catch { /* keep the management error */ }
+        }
+        throw error;
+      }
+    },
+    async collection(input) {
+      if (!current) throw new Error("Plugin settings are not initialized");
+      const request = collectionRequest(current, input);
+      const result = await invoke("settings_plugins_collection", {
+        windowGeneration: current.windowGeneration,
+        coreGenerationId: current.coreGenerationId,
+        ...request,
+      });
+      return validateCollectionResult(request.operation, result);
+    },
+    refreshCurrent,
+    discard() { if (current) applySnapshot(current, { preserveDraft: false, draft: null }); onDirty(); },
+    dispose() { disposed = true; current = null; rebindPromise = null; refreshPromise = null; },
+  });
+}

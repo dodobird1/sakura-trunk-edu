@@ -1,0 +1,686 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import { createRealChatClient } from "../chat/real-chat-client.js";
+import { createChatPresentationReducer } from "../chat/chat-presentation.js";
+import { rebindCharacterPresentation } from "../pet/character-generation.js";
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((ok, fail) => { resolve = ok; reject = fail; });
+  return { promise, resolve, reject };
+}
+
+function lifecyclePublication(generationNumber = 1, state = "running", readiness = "ready") {
+  return {
+    supervisor: {
+      state,
+      generationId: `generation-${generationNumber}`,
+      generationNumber,
+      appShutdown: false,
+      failure: state === "failed" ? {
+        code: "unexpected_exit",
+        message: "Core 进程意外退出。",
+      } : null,
+    },
+    snapshot: readiness ? {
+      generationId: `generation-${generationNumber}`,
+      revision: 7,
+      readiness,
+    } : null,
+  };
+}
+
+function harness(sendResponses = []) {
+  const channels = [];
+  const cancelResponses = [];
+  const calls = [];
+  const intervals = new Map();
+  let nextInterval = 0;
+  let publication = lifecyclePublication();
+  globalThis.window = {
+    setInterval(callback) { const id = ++nextInterval; intervals.set(id, callback); return id; },
+    clearInterval(id) { intervals.delete(id); },
+  };
+  const invoke = async (name, payload) => {
+    const { onEvent, ...args } = payload || {};
+    calls.push([name, Object.keys(args).length ? args : undefined]);
+    if (name === "runtime_lifecycle_snapshot") return publication;
+    if (["chat_send", "chat_update_announce"].includes(name)) return sendResponses.shift();
+    if (name === "chat_cancel") return cancelResponses.length ? cancelResponses.shift() : { accepted: true, operationId: payload.payload.operationId };
+    throw new Error(name);
+  };
+  return {
+    calls,
+    channels,
+    cancelResponses,
+    emit(payload, index = channels.length - 1) { channels[index]?.onmessage(payload); },
+    setPublication(next) { publication = next; },
+    async tick() {
+      await Promise.all([...intervals.values()].map((callback) => callback()));
+    },
+    create(onEvent, options = {}) {
+      return createRealChatClient({
+        invoke,
+        createChannel: () => { const channel = { onmessage: () => {} }; channels.push(channel); return channel; },
+        onEvent,
+        initialPreparedGenerationId: "generation-1",
+        ...options,
+      });
+    },
+  };
+}
+
+test("same-generation role switch waits for binding, then starts the new greeting without another lifecycle change", async () => {
+  const env = harness();
+  const binding = deferred();
+  const entered = deferred();
+  let reducer = createChatPresentationReducer({ initialMessage: "hello alpha" });
+  let currentCharacterId = "alpha";
+  let greetingPending = false;
+  let greeting = null;
+  const publication = role => ({ ...lifecyclePublication(), characterPresentation: { characterId: role } });
+  env.setPublication(publication("alpha"));
+  const client = env.create(event => {
+    reducer.reduce(event);
+    if (greetingPending && event.status === "ready") {
+      greetingPending = false;
+      greeting = reducer.beginGreeting();
+    }
+  }, { prepareGeneration: async ({ characterId, refresh }) => {
+    assert.equal(refresh, true);
+    if (characterId === "beta") {
+      entered.resolve();
+      await binding.promise;
+      const rebound = rebindCharacterPresentation({ currentCharacterId, currentReducer: reducer,
+        nextPresentation: { characterId, initialMessage: "hello beta" } });
+      reducer = rebound.reducer;
+      greetingPending = rebound.greetingPending;
+      currentCharacterId = characterId;
+    }
+    return true;
+  } });
+  try {
+    await client.start();
+    env.setPublication(publication("beta"));
+    const tick = env.tick();
+    await entered.promise;
+    await assert.rejects(client.send({ message: "too early" }), /CHAT_NOT_READY/);
+    binding.resolve();
+    await tick;
+    assert.equal(greeting.applied, true);
+    assert.equal(reducer.current().lifecycle, "ready");
+    assert.equal(greeting.state.segments[0].text, "hello beta");
+    await env.tick();
+    assert.equal(reducer.current().phase, "typing");
+  } finally {
+    binding.resolve();
+    client.dispose();
+  }
+});
+
+test("started and terminal events may win the send response race without leaving a duplicate active turn", async () => {
+  const response = deferred();
+  const events = [];
+  const env = harness([response.promise, {
+    accepted: true,
+    operationId: "op-2",
+    cancelHandle: "cancel-2",
+    generationId: "generation-1",
+    generationNumber: 1,
+  }]);
+  const client = env.create((event) => events.push(event));
+  await client.start();
+  const first = client.send({ message: "first" });
+  env.emit({ type: "chat.started", generationId: "generation-1", generationNumber: 1, operationId: "op-1" });
+  env.emit({
+    type: "chat.completed",
+    generationId: "generation-1",
+    generationNumber: 1,
+    operationId: "op-1",
+    reply: { historyEntryId: "saved-assistant", segments: [{ text: "done" }] },
+  });
+  response.resolve({
+    accepted: true,
+    operationId: "op-1",
+    cancelHandle: "cancel-1",
+    generationId: "generation-1",
+    generationNumber: 1,
+  });
+  await first;
+  await client.send({ message: "second" });
+  assert.deepEqual(events.slice(1).map((event) => event.type), ["chat.started", "chat.completed"]);
+  assert.equal(events.at(-1).reply.historyEntryId, "saved-assistant");
+  assert.equal(env.calls.filter(([name]) => name === "chat_send").length, 2);
+  client.dispose();
+});
+
+test("degraded readiness keeps the usable Assistant session chat-capable", async () => {
+  const events = [];
+  const env = harness([{
+    accepted: true,
+    operationId: "op-degraded",
+    cancelHandle: "cancel-degraded",
+    generationId: "generation-1",
+    generationNumber: 1,
+  }]);
+  env.setPublication(lifecyclePublication(1, "running", "degraded"));
+  const client = env.create((event) => events.push(event));
+
+  await client.start();
+  await client.send({ message: "still available" });
+  env.emit({
+    type: "chat.started",
+    generationId: "generation-1",
+    generationNumber: 1,
+    operationId: "op-degraded",
+  });
+  env.emit({
+    type: "chat.completed",
+    generationId: "generation-1",
+    generationNumber: 1,
+    operationId: "op-degraded",
+    reply: { segments: [{ text: "done" }] },
+  });
+
+  assert.equal(events[0].status, "degraded");
+  assert.deepEqual(events.slice(1).map((event) => event.type), ["chat.started", "chat.completed"]);
+  assert.equal(client.isBusy(), false);
+  client.dispose();
+});
+
+test("generation change seals pending send, cancel, and old native events", async () => {
+  const response = deferred();
+  const events = [];
+  const env = harness([response.promise]);
+  const client = env.create((event) => events.push(event));
+  await client.start();
+
+  const send = client.send({ message: "will be interrupted" });
+  env.emit({ type: "chat.started", generationId: "generation-1", generationNumber: 1, operationId: "old-op" });
+  assert.equal(await client.cancel("old-op"), true);
+
+  env.setPublication(lifecyclePublication(2, "spawning", null));
+  await env.tick();
+  response.resolve({
+    accepted: true,
+    operationId: "old-op",
+    cancelHandle: "old-cancel",
+    generationId: "generation-1",
+    generationNumber: 1,
+  });
+  await assert.rejects(send, /CHAT_GENERATION_INVALIDATED/);
+
+  const count = events.length;
+  env.emit({
+    type: "chat.completed",
+    generationId: "generation-1",
+    generationNumber: 1,
+    operationId: "old-op",
+    reply: { segments: [{ text: "late" }] },
+  });
+  assert.equal(events.length, count);
+  assert.equal(env.calls.some(([name]) => name === "chat_cancel"), false);
+  client.dispose();
+});
+
+test("new generation stays rehydrating until its complete Snapshot resources are prepared", async () => {
+  const gate = deferred();
+  const events = [];
+  const env = harness();
+  const client = env.create((event) => events.push(event), {
+    prepareGeneration: ({ generationId }) => {
+      assert.equal(generationId, "generation-2");
+      return gate.promise;
+    },
+  });
+  await client.start();
+
+  env.setPublication(lifecyclePublication(2));
+  const poll = env.tick();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(events.at(-1).status, "rehydrating");
+  assert.equal(events.some((event) => event.generationNumber === 2 && event.status === "ready"), false);
+
+  gate.resolve(true);
+  await poll;
+  assert.equal(events.at(-1).status, "ready");
+  assert.equal(events.at(-1).generationNumber, 2);
+  client.dispose();
+});
+
+test("a new character binds while Assistant initializes and stays visible when chat needs setup or fails", async () => {
+  const env = harness();
+  const binding = deferred();
+  const entered = deferred();
+  const events = [];
+  const prepared = [];
+  let visibleCharacter = "alpha";
+  const client = env.create(event => events.push(event), {
+    prepareGeneration: async value => {
+      prepared.push(value);
+      entered.resolve();
+      await binding.promise;
+      visibleCharacter = value.characterId;
+      return true;
+    },
+  });
+  try {
+    await client.start();
+    env.setPublication(lifecyclePublication(2, "running", "initializing"));
+    await env.tick();
+    assert.equal(prepared.length, 0);
+    env.setPublication({ ...lifecyclePublication(2, "running", "initializing"),
+      characterPresentation: { generationId: "generation-1", characterId: "alpha" } });
+    await env.tick();
+    assert.equal(prepared.length, 0);
+
+    const characterPresentation = { generationId: "generation-2", characterId: "beta" };
+    env.setPublication({ ...lifecyclePublication(2, "running", "initializing"), characterPresentation });
+    const poll = env.tick();
+    await entered.promise;
+    assert.equal(events.at(-1).status, "rehydrating");
+    await assert.rejects(client.send({ message: "wait for Assistant" }), /CHAT_NOT_READY/);
+    binding.resolve();
+    await poll;
+    assert.equal(visibleCharacter, "beta");
+    assert.equal(events.at(-1).status, "initializing");
+
+    for (const state of ["initializing", "setup_required", "failed"]) {
+      env.setPublication({ ...lifecyclePublication(2, "running", state), characterPresentation });
+      await env.tick();
+      assert.equal(visibleCharacter, "beta");
+      assert.equal(prepared.length, 1);
+      assert.equal(events.at(-1).status, state);
+      assert.equal(events.at(-1).canRetry, false);
+      await assert.rejects(client.send({ message: "wait for Assistant" }), /CHAT_NOT_READY/);
+    }
+    assert.equal(env.calls.some(([name]) => name === "chat_send"), false);
+  } finally {
+    binding.resolve();
+    client.dispose();
+  }
+});
+
+test("first use without a character stays quiet across polls and binds after the first import", async () => {
+  const events = [];
+  const prepared = [];
+  const env = harness();
+  const empty = lifecyclePublication(1, "running", "setup_required");
+  env.setPublication(empty);
+  const client = env.create(event => events.push(event), {
+    initialPreparedGenerationId: null,
+    prepareGeneration: async args => {
+      prepared.push(args);
+      return Boolean(args.characterId);
+    },
+  });
+  try {
+    await client.start();
+    await env.tick();
+    await env.tick();
+    assert.deepEqual(prepared, [], "no resources exist to load before character import");
+    assert.deepEqual(events.map(event => event.status), ["setup_required"]);
+    await assert.rejects(client.send({ message: "no character yet" }), /CHAT_NOT_READY/);
+
+    const characterPresentation = { generationId: "generation-1", characterId: "imported" };
+    env.setPublication({ ...empty, characterPresentation });
+    await env.tick();
+    assert.equal(prepared.length, 1);
+    assert.equal(prepared[0].characterId, "imported");
+    assert.equal(events.at(-1).status, "setup_required", "model setup does not block character binding");
+    await env.tick();
+    assert.equal(prepared.length, 1);
+
+    env.setPublication({ ...lifecyclePublication(), characterPresentation });
+    await env.tick();
+    assert.equal(events.at(-1).status, "ready");
+    assert.equal(prepared.length, 1);
+  } finally {
+    client.dispose();
+  }
+});
+
+test("a stale character publication cannot start resource loading while setup is incomplete or failed", async () => {
+  const events = [];
+  const prepared = [];
+  const env = harness();
+  const client = env.create(event => events.push(event), {
+    prepareGeneration: async args => { prepared.push(args); return false; },
+  });
+  try {
+    await client.start();
+    for (const readiness of ["setup_required", "failed"]) {
+      env.setPublication({ ...lifecyclePublication(2, "running", readiness),
+        characterPresentation: { generationId: "generation-1", characterId: "old" } });
+      await env.tick();
+      await env.tick();
+      assert.equal(events.at(-1).status, readiness);
+      assert.equal(events.at(-1).canRetry, false);
+      assert.deepEqual(prepared, []);
+    }
+  } finally {
+    client.dispose();
+  }
+});
+
+test("failed readiness stays non-retryable while Core is still running", async () => {
+  const events = [];
+  const env = harness();
+  const client = env.create((event) => events.push(event), {
+    prepareGeneration: async () => false,
+  });
+  await client.start();
+
+  env.setPublication({ ...lifecyclePublication(2, "running", "failed"),
+    characterPresentation: { generationId: "generation-2", characterId: "alpha" } });
+  await env.tick();
+  assert.deepEqual(
+    events.filter((event) => event.generationNumber === 2).map(({ status, canRetry }) => [status, canRetry]),
+    [["rehydrating", false], ["failed", false]],
+  );
+  client.dispose();
+});
+
+test("same-character visual reload binds even while the model still needs setup", async () => {
+  const env = harness();
+  const prepared = [];
+  const events = [];
+  const publish = bindingId => ({ ...lifecyclePublication(1, "running", "setup_required"),
+    characterPresentation: { generationId: "generation-1", characterId: "alpha", visual: { bindingId } } });
+  env.setPublication(publish("old"));
+  const client = env.create(event => events.push(event), { prepareGeneration: async args => {
+    prepared.push(args);
+    return true;
+  } });
+  try {
+    await client.start();
+    env.setPublication(publish("replacement"));
+    await env.tick();
+    assert.equal(prepared.length, 2);
+    assert.equal(prepared[1].refresh, true);
+    assert.equal(events.at(-1).status, "setup_required");
+    await env.tick();
+    assert.equal(prepared.length, 2, "an unchanged binding is not remounted every poll");
+    await assert.rejects(client.send({ message: "not configured" }), /CHAT_NOT_READY/);
+  } finally {
+    client.dispose();
+  }
+});
+
+test("stopped Core failure exposes its safe reason and manual retry", async () => {
+  const events = [];
+  const env = harness();
+  const client = env.create((event) => events.push(event));
+  await client.start();
+
+  env.setPublication(lifecyclePublication(1, "failed", null));
+  await env.tick();
+  const failure = events.at(-1);
+  assert.equal(failure.status, "failed");
+  assert.equal(failure.canRetry, true);
+  assert.deepEqual(failure.failure, {
+    code: "unexpected_exit",
+    message: "Core 进程意外退出。",
+  });
+  client.dispose();
+});
+
+test("cancel clicked after early started waits for the opaque send response handle", async () => {
+  const response = deferred();
+  const env = harness([response.promise]);
+  const client = env.create(() => {});
+  await client.start();
+  const send = client.send({ message: "slow" });
+  env.emit({ type: "chat.started", generationId: "generation-1", generationNumber: 1, operationId: "op-slow" });
+  assert.equal(await client.cancel("op-slow"), true);
+  response.resolve({
+    accepted: true,
+    operationId: "op-slow",
+    cancelHandle: "opaque-cancel",
+    generationId: "generation-1",
+    generationNumber: 1,
+  });
+  await send;
+  assert.deepEqual(env.calls.find(([name]) => name === "chat_cancel"), [
+    "chat_cancel",
+    { payload: { operationId: "op-slow", cancelHandle: "opaque-cancel" } },
+  ]);
+  client.dispose();
+});
+
+test("send forwards only the opaque screenshot attachment id when present", async () => {
+  const attachmentId = `screen-${"a".repeat(32)}`;
+  const env = harness([{
+    accepted: true,
+    operationId: "op-screen",
+    cancelHandle: "cancel-screen",
+    generationId: "generation-1",
+    generationNumber: 1,
+  }]);
+  const client = env.create(() => {});
+  await client.start();
+  await client.send({ message: "看看这里", attachmentId });
+  assert.deepEqual(env.calls.find(([name]) => name === "chat_send"), [
+    "chat_send",
+    { payload: { message: "看看这里", attachmentId } },
+  ]);
+  client.dispose();
+});
+
+test("silent sends tag their started and terminal events without changing the native payload", async () => {
+  const response = deferred();
+  const events = [];
+  const env = harness([response.promise]);
+  const client = env.create((event) => events.push(event));
+  await client.start();
+
+  const send = client.send({ message: "主动观察", presentation: "silent" });
+  env.emit({ type: "chat.started", generationId: "generation-1", generationNumber: 1, operationId: "op-silent" });
+  assert.equal(client.isBusy(), true);
+  env.emit({
+    type: "chat.completed",
+    generationId: "generation-1",
+    generationNumber: 1,
+    operationId: "op-silent",
+    reply: { segments: [{ text: "接着做吧。" }] },
+  });
+  response.resolve({
+    accepted: true,
+    operationId: "op-silent",
+    cancelHandle: "cancel-silent",
+    generationId: "generation-1",
+    generationNumber: 1,
+  });
+  await send;
+
+  assert.deepEqual(events.slice(1).map(({ type, presentation }) => [type, presentation]), [
+    ["chat.started", "silent"],
+    ["chat.completed", "silent"],
+  ]);
+  assert.deepEqual(env.calls.find(([name]) => name === "chat_send"), [
+    "chat_send",
+    { payload: { message: "主动观察" } },
+  ]);
+  assert.equal(client.isBusy(), false);
+  client.dispose();
+});
+
+test("update announcements use the restricted native command with silent presentation", async () => {
+  const events = [];
+  const env = harness([{
+    accepted: true,
+    operationId: "op-update",
+    cancelHandle: "cancel-update",
+    generationId: "generation-1",
+    generationNumber: 1,
+  }]);
+  const client = env.create((event) => events.push(event));
+  await client.start();
+
+  await client.announceUpdate();
+  env.emit({
+    type: "chat.started",
+    generationId: "generation-1",
+    generationNumber: 1,
+    operationId: "op-update",
+  });
+  env.emit({
+    type: "chat.completed",
+    generationId: "generation-1",
+    generationNumber: 1,
+    operationId: "op-update",
+    reply: { segments: [{ text: "发现新版本。" }] },
+  });
+
+  assert.deepEqual(env.calls.find(([name]) => name === "chat_update_announce"), [
+    "chat_update_announce",
+    undefined,
+  ]);
+  assert.deepEqual(events.slice(1).map(({ type, presentation }) => [type, presentation]), [
+    ["chat.started", "silent"],
+    ["chat.completed", "silent"],
+  ]);
+  assert.equal(client.isBusy(), false);
+  client.dispose();
+});
+
+test("old operation channels cannot complete a newer send or accumulate early terminals", async () => {
+  const events = [];
+  const response = (id) => ({ accepted: true, operationId: id, cancelHandle: `cancel-${id}`, generationId: "generation-1", generationNumber: 1 });
+  const env = harness([response("first"), response("second")]);
+  const client = env.create((event) => events.push(event));
+  await client.start();
+  await client.send({ message: "first" });
+  env.emit({ ...response("first"), type: "chat.started" }, 0);
+  env.emit({ ...response("first"), type: "chat.completed", reply: { segments: [] } }, 0);
+  await client.send({ message: "second", presentation: "silent" });
+  const before = events.length;
+  env.emit({ ...response("first"), type: "chat.failed" }, 0);
+  assert.equal(events.length, before);
+  assert.equal(client.isBusy(), true);
+  env.emit({ ...response("second"), type: "chat.started" }, 1);
+  assert.equal(events.at(-1).presentation, "silent");
+  client.dispose();
+  env.emit({ ...response("second"), type: "chat.completed" }, 1);
+  assert.equal(events.at(-1).type, "chat.started");
+});
+
+test("send rejection releases its channel and a failed cancellation can be requested again", async () => {
+  const rejection = deferred();
+  const env = harness([rejection.promise, {
+    accepted: true, operationId: "accepted", cancelHandle: "cancel", generationId: "generation-1", generationNumber: 1,
+  }]);
+  const events = [];
+  const client = env.create((event) => events.push(event));
+  await client.start();
+  const first = client.send({ message: "rejected" });
+  rejection.reject(new Error("CHAT_BUSY"));
+  await assert.rejects(first, /CHAT_BUSY/);
+  assert.equal(client.isBusy(), false);
+  await client.send({ message: "accepted" });
+  env.emit({ type: "chat.started", operationId: "accepted", generationId: "generation-1", generationNumber: 1 });
+  const failedCancel = deferred();
+  env.cancelResponses.push(failedCancel.promise);
+  const cancel = client.cancel("accepted");
+  failedCancel.reject(new Error("TRANSPORT_WRITE_FAILED"));
+  await assert.rejects(cancel, /TRANSPORT_WRITE_FAILED/);
+  assert.equal(client.isBusy(), true);
+  assert.equal(await client.cancel("accepted"), true);
+  client.dispose();
+});
+
+test("queued cancellation failure does not reject an already accepted send", async () => {
+  const accepted = deferred();
+  const cancelled = deferred();
+  const cancelErrors = [];
+  const env = harness([accepted.promise]);
+  const client = env.create(() => {}, { onCancelError: (error) => cancelErrors.push(error.message) });
+  await client.start();
+  const send = client.send({ message: "accepted first" });
+  env.emit({ type: "chat.started", operationId: "op", generationId: "generation-1", generationNumber: 1 });
+  assert.equal(await client.cancel("op"), true);
+  env.cancelResponses.push(cancelled.promise);
+  accepted.resolve({ accepted: true, operationId: "op", cancelHandle: "cancel", generationId: "generation-1", generationNumber: 1 });
+  assert.equal((await send).accepted, true);
+  cancelled.reject(new Error("cancel unavailable"));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(cancelErrors, ["cancel unavailable"]);
+  assert.equal(await client.cancel("op"), true);
+  client.dispose();
+});
+
+for (const presentation of ["silent", "interactive"]) {
+  test(`host ${presentation} messages enter the ordinary cancellable operation`, async () => {
+    const response = { accepted: true, operationId: "screen", cancelHandle: "cancel", generationId: "generation-1", generationNumber: 1, presentation };
+    const env = harness();
+    const events = [];
+    let hostChannel;
+    const client = env.create(event => events.push(event), { listenHost: async channel => { hostChannel = channel; } });
+    await client.start();
+    hostChannel.onmessage({ ...response, type: "chat.started" });
+    assert.equal(client.isBusy(), true);
+    assert.equal(events.at(-1).presentation, presentation);
+    assert.equal(await client.cancel("screen"), true);
+    assert.deepEqual(env.calls.find(([name]) => name === "chat_cancel"), [
+      "chat_cancel", { payload: { operationId: "screen", cancelHandle: "cancel" } }]);
+    hostChannel.onmessage({ ...response, type: "chat.completed", reply: { segments: [] } });
+    assert.equal(events.at(-1).presentation, presentation);
+    assert.equal(client.isBusy(), false);
+    const before = events.length;
+    hostChannel.onmessage({ ...response, type: "chat.completed", reply: { segments: [] } });
+    assert.equal(events.length, before);
+    client.dispose();
+    hostChannel.onmessage({ ...response, type: "chat.started" });
+    assert.equal(events.length, before);
+  });
+}
+
+test("host subscription is rebound on generation change and cannot replace an accepted manual operation", async () => {
+  const env = harness([{ accepted: true, operationId: "manual", cancelHandle: "cancel",
+    generationId: "generation-1", generationNumber: 1 }]);
+  const events = [], subscriptions = [];
+  const client = env.create(event => events.push(event), { listenHost: async channel => subscriptions.push(channel) });
+  await client.start();
+  await client.send({ message: "manual" });
+  env.emit({ type: "chat.started", operationId: "manual", generationId: "generation-1", generationNumber: 1 });
+  const before = events.length;
+  subscriptions[0].onmessage({ type: "chat.started", operationId: "plugin", generationId: "generation-1", generationNumber: 1 });
+  assert.equal(events.length, before);
+  env.setPublication(lifecyclePublication(2));
+  await env.tick();
+  assert.equal(subscriptions.length, 2);
+  const after = events.length;
+  subscriptions[0].onmessage({ type: "chat.started", operationId: "late", generationId: "generation-1", generationNumber: 1 });
+  subscriptions[1].onmessage({ type: "chat.completed", operationId: "late", generationId: "generation-2", generationNumber: 2 });
+  assert.equal(events.length, after);
+  assert.equal(client.isBusy(), false);
+  client.dispose();
+});
+
+test("native host events delivered before listen registration resolves retain started and terminal", async () => {
+  const listening = deferred(), registered = deferred();
+  const events = [];
+  const env = harness();
+  let channel;
+  const client = env.create(event => events.push(event), { listenHost: async current => {
+    channel = current;
+    current.onmessage({ type: "chat.started", operationId: "early", cancelHandle: "opaque",
+      generationId: "generation-1", generationNumber: 1 });
+    registered.resolve();
+    await listening.promise;
+  } });
+  const starting = client.start();
+  await registered.promise;
+  assert.equal(client.isBusy(), true);
+  assert.deepEqual(events.map(event => event.type), ["lifecycle", "chat.started"]);
+  channel.onmessage({ type: "chat.completed", operationId: "early", generationId: "generation-1", generationNumber: 1,
+    reply: { segments: [] } });
+  assert.equal(events.at(-1).type, "chat.completed");
+  assert.equal(client.isBusy(), false);
+  listening.resolve();
+  await starting;
+  client.dispose();
+});

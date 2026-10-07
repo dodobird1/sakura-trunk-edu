@@ -1,0 +1,25 @@
+{
+  "id": "xiaoniao",
+  "display_name": "小鸟",
+  "initial_message": "你好。我是小鸟。写程序的时候，按旁边的按钮就行。",
+  "card": "card.md",
+  "portrait": {
+    "default": "portraits/idle.png",
+    "expressions": {
+      "平常": "portraits/idle.png",
+      "想": "portraits/think.png",
+      "高兴": "portraits/happy.png",
+      "困惑": "portraits/confused.png"
+    }
+  },
+  "reply": {
+    "tones": ["平常", "想", "高兴", "困惑"]
+  },
+  "pluginRequirements": [
+    {
+      "kind": "visual",
+      "type": "sakura.visual.portrait@1",
+      "plugins": [{"id": "sakura.portrait", "name": "立绘"}]
+    }
+  ]
+}

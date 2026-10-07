@@ -1,0 +1,173 @@
+export function createLayoutController({
+  computeLayout,
+  applyNativeLayout,
+  previewLayout = null,
+  commitLayout,
+  initialRevision = 0,
+}) {
+  if (!Number.isSafeInteger(initialRevision) || initialRevision < 0) {
+    throw new Error("initial layout revision must be a non-negative safe integer");
+  }
+  let requestedRevision = initialRevision;
+  let currentState = null;
+  let committedLayout = null;
+  let nativeRunning = false;
+  let pendingNative = null;
+  let latestPreviewRevision = 0;
+
+  function rejectedResult({ revision, state }) {
+    return Object.freeze({ applied: false, revision, state });
+  }
+
+  function restoreCommittedPreview(work) {
+    if (
+      work.previewed
+      && work.revision === requestedRevision
+      && work.state === currentState
+      && committedLayout
+      && previewLayout
+    ) {
+      previewLayout(committedLayout, {
+        rollback: true,
+        revision: work.revision,
+        state: work.state,
+        interactionTrace: work.interactionTrace,
+      });
+    }
+  }
+
+  async function applyPendingNative(work) {
+    let nativeResult;
+    try {
+      nativeResult = await applyNativeLayout({
+        state: work.state,
+        revision: work.revision,
+        layout: work.layout,
+        interactionTrace: work.interactionTrace,
+      });
+    } catch (error) {
+      restoreCommittedPreview(work);
+      work.reject(error);
+      return;
+    }
+
+    if (!nativeResult.applied) {
+      restoreCommittedPreview(work);
+      work.resolve(rejectedResult(work));
+      return;
+    }
+    if (nativeResult.contractVersion !== work.layout.contractVersion) {
+      restoreCommittedPreview(work);
+      work.reject(new Error("Rust and WebView layout contracts do not match"));
+      return;
+    }
+    if (work.state !== currentState) {
+      work.resolve(rejectedResult(work));
+      return;
+    }
+
+    try {
+      const isCurrent = work.revision === requestedRevision;
+      if (!isCurrent && (work.previewed || work.revision < latestPreviewRevision)) {
+        work.resolve(rejectedResult(work));
+        return;
+      }
+      // Ordinary adaptive changes remain paired with their precise Win32 clip. During an explicit
+      // settings preview a coarse native region already follows the latest frame, so stale native
+      // acknowledgements must not paint over the newest immediate WebView frame.
+      work.commitVisual?.(work.layout, nativeResult);
+      commitLayout(work.layout, nativeResult, { interactionTrace: work.interactionTrace });
+      committedLayout = work.layout;
+      work.resolve(isCurrent
+        ? Object.freeze({
+          applied: true,
+          revision: work.revision,
+          state: work.state,
+          nativeResult,
+        })
+        : rejectedResult(work));
+    } catch (error) {
+      work.reject(error);
+    }
+  }
+
+  async function drainNativeQueue() {
+    if (nativeRunning) return;
+    nativeRunning = true;
+    while (pendingNative) {
+      const work = pendingNative;
+      pendingNative = null;
+      await applyPendingNative(work);
+    }
+    nativeRunning = false;
+  }
+
+  function enqueueNative(work) {
+    return new Promise((resolve, reject) => {
+      if (pendingNative) pendingNative.resolve(rejectedResult(pendingNative));
+      pendingNative = { ...work, resolve, reject };
+      void drainNativeQueue();
+    });
+  }
+
+  return Object.freeze({
+    async transition(state, placeholderText = "", input = undefined) {
+      const revision = ++requestedRevision;
+      currentState = state;
+      const layout = computeLayout(state, placeholderText, input);
+      const previewed = Boolean(input?.visualPreview && previewLayout);
+      if (previewed) latestPreviewRevision = revision;
+      if (previewed) previewLayout(layout, {
+        rollback: false,
+        revision,
+        state,
+        deferNative: input?.deferNative === true,
+        interactionTrace: input?.interactionTrace || null,
+      });
+      if (input?.deferNative) {
+        input.commitVisual?.(layout, null);
+        return Object.freeze({
+          applied: true,
+          revision,
+          state,
+          deferredNative: true,
+        });
+      }
+      // Keep only one native request behind the in-flight call. Slider input can arrive much
+      // faster than Windows can rebuild its visible/click-through region, so pending intermediate
+      // targets are superseded instead of forming the previous one-second backlog.
+      return enqueueNative({
+        state,
+        revision,
+        layout,
+        previewed,
+        commitVisual: typeof input?.commitVisual === "function" ? input.commitVisual : null,
+        interactionTrace: input?.interactionTrace || null,
+      });
+    },
+    snapshot() {
+      return Object.freeze({ requestedRevision, currentState });
+    },
+  });
+}
+
+export async function runInitialLayoutWithBootstrapRecovery({
+  transition,
+  readBootstrapDiagnostics,
+  restoreBootstrap,
+}) {
+  if (
+    typeof transition !== "function"
+    || typeof readBootstrapDiagnostics !== "function"
+    || typeof restoreBootstrap !== "function"
+  ) {
+    throw new Error("initial layout recovery requires transition and bootstrap callbacks");
+  }
+  try {
+    const result = await transition();
+    if (result?.applied) return Object.freeze({ degraded: false, result });
+  } catch {}
+  const diagnostics = await readBootstrapDiagnostics();
+  const bootstrap = restoreBootstrap(diagnostics);
+  return Object.freeze({ degraded: true, bootstrap, diagnostics });
+}

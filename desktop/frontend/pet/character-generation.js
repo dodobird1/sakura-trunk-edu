@@ -1,0 +1,27 @@
+import { createChatPresentationReducer } from "../chat/chat-presentation.js";
+
+export function isNewCharacterGeneration(previous, next) {
+  return Boolean(previous && next !== previous);
+}
+
+export function rebindCharacterPresentation({
+  currentCharacterId,
+  nextPresentation,
+  currentReducer,
+}) {
+  if (nextPresentation.characterId === currentCharacterId) {
+    return Object.freeze({
+      characterChanged: false,
+      reducer: currentReducer,
+      greetingPending: false,
+    });
+  }
+  return Object.freeze({
+    characterChanged: true,
+    reducer: createChatPresentationReducer({
+      initialMessage: nextPresentation.initialMessage,
+      initialMessageTranslation: nextPresentation.initialMessageTranslation,
+    }),
+    greetingPending: true,
+  });
+}

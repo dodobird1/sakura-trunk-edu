@@ -1,0 +1,372 @@
+"""Bounded concurrent transport router for the Runtime v2 chat surface.
+
+The router deliberately owns no Assistant objects.  It only separates frame
+reading, control dispatch, bounded fixture execution, event publication and
+the single stdout writer. Assistant domain objects stay behind the injected boundary.
+"""
+
+from __future__ import annotations
+
+import queue
+import sys
+import threading
+from collections.abc import Callable, Mapping
+from contextlib import AbstractContextManager, nullcontext
+from dataclasses import dataclass, field as dataclass_field
+from time import monotonic
+from typing import Any, BinaryIO
+
+from .protocol import read_frame, response
+
+
+DISPATCH_QUEUE_LIMIT = 32
+FIXTURE_QUEUE_LIMIT = 8
+FIXTURE_WORKER_COUNT = 4
+ROUTER_CLOSE_TIMEOUT_SECONDS = 3.0
+
+_STOP = object()
+
+
+def _request_interaction_context(
+    request: Mapping[str, Any],
+) -> AbstractContextManager[None]:
+    if request.get("name") != "chat.send":
+        return nullcontext()
+    operation_id = request.get("id")
+    if not isinstance(operation_id, str) or not operation_id.strip():
+        return nullcontext()
+    from app.core.interaction import interaction_context
+
+    return interaction_context(operation_id)
+
+
+@dataclass
+class _Ticket:
+    request: dict[str, Any]
+    received_at: float = dataclass_field(default_factory=monotonic)
+    done: threading.Event = dataclass_field(default_factory=threading.Event)
+    error: BaseException | None = None
+
+
+class RouterFailure(RuntimeError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(f"{code}: {message}")
+        self.code = code
+        self.message = message
+
+
+class ConcurrentHostRouter:
+    """Run one reader, one dispatcher, bounded fixture slots and one writer."""
+
+    def __init__(
+        self,
+        input_stream: BinaryIO,
+        writer: Any,
+        dispatcher: Any,
+        *,
+        fixture_handler: Callable[[dict[str, Any]], Mapping[str, Any]] | None = None,
+        fixture_reserve: Callable[[dict[str, Any]], None] | None = None,
+        fixture_abandon: Callable[[dict[str, Any]], None] | None = None,
+        fixture_names: frozenset[str] = frozenset(),
+        read_frame_fn: Callable[[BinaryIO], dict[str, Any] | None] = read_frame,
+    ) -> None:
+        self._input = input_stream
+        self._writer = writer
+        self._dispatcher = dispatcher
+        self._fixture_handler = fixture_handler
+        self._fixture_reserve = fixture_reserve
+        self._fixture_abandon = fixture_abandon
+        self._fixture_names = fixture_names
+        self._read_frame = read_frame_fn
+        self._dispatch: queue.Queue[_Ticket | object] = queue.Queue(maxsize=DISPATCH_QUEUE_LIMIT)
+        self._fixtures: queue.Queue[_Ticket | object] = queue.Queue(maxsize=FIXTURE_QUEUE_LIMIT)
+        self._stop = threading.Event()
+        self._events_closing = threading.Event()
+        self._closed = False
+        self._lock = threading.Lock()
+        self._fatal: BaseException | None = None
+        self._threads: list[threading.Thread] = []
+
+    @property
+    def fatal_error(self) -> BaseException | None:
+        with self._lock:
+            return self._fatal
+
+    def publish_event(self, message: Mapping[str, Any]) -> None:
+        """Wait for the shared protocol writer to acknowledge this event."""
+        if self._events_closing.is_set():
+            raise RouterFailure("GENERATION_INVALIDATED", "router is closing")
+        try:
+            self._send(message)
+        except BaseException as error:  # noqa: BLE001 - fail the generation and publisher together
+            self._set_fatal(error)
+            raise
+
+    def run(self) -> None:
+        self._start_threads()
+        try:
+            # This is the sole owner of input reads.  Dispatch and fixture work
+            # never execute on this reader thread.
+            while not self._stop.is_set():
+                if self.fatal_error is not None:
+                    raise self.fatal_error
+                request = self._read_frame(self._input)
+                if request is None:
+                    break
+                ticket = _Ticket(request)
+                try:
+                    self._dispatch.put(ticket, timeout=ROUTER_CLOSE_TIMEOUT_SECONDS)
+                except queue.Full as error:
+                    raise RouterFailure("DISPATCH_QUEUE_FULL", "dispatcher queue is full") from error
+                if not self._is_fixture(request):
+                    # Control acknowledgements are bounded and keep the reader
+                    # from consuming unbounded input after a writer failure.
+                    ticket.done.wait(ROUTER_CLOSE_TIMEOUT_SECONDS)
+                    if ticket.error is not None:
+                        raise ticket.error
+                if request.get("name") == "system.shutdown":
+                    # Shutdown response is handled by the dispatcher; do not
+                    # read an unbounded stream after the terminal control item.
+                    ticket.done.wait(ROUTER_CLOSE_TIMEOUT_SECONDS)
+                    break
+            if self.fatal_error is not None:
+                raise self.fatal_error
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._stop.set()
+        invalidate = getattr(self._dispatcher, "invalidate_generation_work", None)
+        if not callable(invalidate):
+            invalidate = getattr(self._dispatcher, "invalidate_chat_generation", None)
+        if callable(invalidate):
+            invalidate()
+        self._put_stop(self._dispatch)
+        self._put_stop(self._fixtures)
+        deadline = monotonic() + ROUTER_CLOSE_TIMEOUT_SECONDS
+        for thread in self._threads:
+            thread.join(timeout=max(0.0, deadline - monotonic()))
+        while True:
+            try:
+                queued = self._fixtures.get_nowait()
+            except queue.Empty:
+                break
+            if isinstance(queued, _Ticket):
+                self._abandon_fixture(queued.request)
+                queued.done.set()
+            self._fixtures.task_done()
+        drain_error: BaseException | None = None
+        drain = getattr(self._dispatcher, "drain_generation_work", None)
+        if callable(drain):
+            try:
+                drain()
+            except BaseException as error:  # noqa: BLE001 - finish transport cleanup first
+                drain_error = error
+        self._events_closing.set()
+        alive = [thread.name for thread in self._threads if thread.is_alive()]
+        if alive and self.fatal_error is None:
+            try:
+                print(f"Core router workers still alive: {','.join(alive)}", file=sys.stderr)
+            except Exception:
+                pass
+            self._set_fatal(RouterFailure("ROUTER_CLOSE_TIMEOUT", "router workers did not stop"))
+        if self.fatal_error is not None:
+            raise self.fatal_error
+        if drain_error is not None:
+            raise drain_error
+
+    def _start_threads(self) -> None:
+        specs = (
+            ("sakura-core-host-dispatcher", self._dispatch_loop),
+            *((f"sakura-core-host-fixture-{index}", self._fixture_loop) for index in range(FIXTURE_WORKER_COUNT)),
+        )
+        for name, target in specs:
+            thread = threading.Thread(target=target, name=name)
+            thread.start()
+            self._threads.append(thread)
+
+    @staticmethod
+    def _put_stop(target: queue.Queue[Any]) -> None:
+        try:
+            target.put_nowait(_STOP)
+        except queue.Full:
+            # The worker checks _stop between items.  A full queue therefore
+            # cannot prevent bounded shutdown or force an unbounded sentinel.
+            pass
+
+    def _dispatch_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                item = self._dispatch.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                if item is _STOP:
+                    return
+                assert isinstance(item, _Ticket)
+                request = item.request
+                if self._is_fixture(request):
+                    # Workers bound execution; the queue absorbs short bursts
+                    # from settings, Studio and chat instead of rejecting a
+                    # fifth request while its waiting queue is still empty.
+                    try:
+                        if self._fixture_reserve is not None:
+                            self._fixture_reserve(request)
+                        self._fixtures.put_nowait(item)
+                    except (ValueError, RuntimeError) as error:
+                        self._abandon_fixture(request)
+                        self._send_fixture_rejection(request, item, error)
+                    except queue.Full:
+                        self._abandon_fixture(request)
+                        self._send_overload(request, item)
+                    continue
+                message, should_stop = self._dispatcher.dispatch(request)
+                self._send(message)
+                item.done.set()
+                if should_stop:
+                    self._stop.set()
+                    return
+            except BaseException as error:  # noqa: BLE001 - transferred to owner
+                item.error = error if isinstance(item, _Ticket) else error
+                if isinstance(item, _Ticket):
+                    item.done.set()
+                self._set_fatal(error)
+                return
+            finally:
+                self._dispatch.task_done()
+
+    def _fixture_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                item = self._fixtures.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                if item is _STOP:
+                    return
+                assert isinstance(item, _Ticket)
+                if self._stop.is_set():
+                    self._abandon_fixture(item.request)
+                    item.done.set()
+                    return
+                deadline_ms = item.request.get("deadlineMs")
+                if isinstance(deadline_ms, int) and (monotonic() - item.received_at) * 1000 >= deadline_ms:
+                    self._abandon_fixture(item.request)
+                    self._send(response(
+                        item.request,
+                        generation_id=str(item.request["generationId"]),
+                        generation_credential=str(item.request["generationCredential"]),
+                        protocol_minor=int(item.request["protocolMinor"]),
+                        error={"code": "REQUEST_DEADLINE_EXCEEDED", "message": "请求等待超时，请重试。", "retryable": True, "details": {}},
+                    ))
+                    item.done.set()
+                    continue
+                try:
+                    try:
+                        with _request_interaction_context(item.request):
+                            result = self._fixture_handler(item.request)  # type: ignore[misc]
+                    except Exception as error:
+                        if self.fatal_error is not None:
+                            raise
+                        self._abandon_fixture(item.request)
+                        self._send_fixture_rejection(item.request, item, error, fallback_code="REQUEST_FAILED")
+                        continue
+                    self._send(result)
+                finally:
+                    item.done.set()
+            except BaseException as error:  # noqa: BLE001 - transferred to owner
+                item.error = error if isinstance(item, _Ticket) else error
+                if isinstance(item, _Ticket):
+                    item.done.set()
+                self._set_fatal(error)
+            finally:
+                self._fixtures.task_done()
+
+    def _abandon_fixture(self, request: dict[str, Any]) -> None:
+        if self._fixture_abandon is not None:
+            self._fixture_abandon(request)
+
+    def _is_fixture(self, request: Mapping[str, Any]) -> bool:
+        name = request.get("name")
+        return self._fixture_handler is not None and (
+            name in self._fixture_names or (isinstance(name, str) and name.startswith("fixture."))
+        )
+
+    def _send_overload(self, request: dict[str, Any], ticket: _Ticket) -> None:
+        message = response(
+            request,
+            generation_id=str(request["generationId"]),
+            generation_credential=str(request["generationCredential"]),
+            protocol_minor=int(request["protocolMinor"]),
+            error={
+                "code": "ROUTER_QUEUE_FULL",
+                "message": "当前任务较多，请稍后重试。",
+                "retryable": True,
+                "details": {},
+            },
+        )
+        self._send(message)
+        ticket.done.set()
+
+    def _send_fixture_rejection(
+        self,
+        request: dict[str, Any],
+        ticket: _Ticket,
+        error: BaseException,
+        *,
+        fallback_code: str = "INVALID_CHAT_PAYLOAD",
+    ) -> None:
+        code = str(getattr(error, "code", "")) or (
+            "CHAT_EXECUTION_LIMIT_EXCEEDED"
+            if str(error) == "CHAT_EXECUTION_LIMIT_EXCEEDED"
+            else fallback_code
+        )
+        public_message = str(getattr(error, "public_message", "")) or "请求执行失败。"
+        retryable = bool(getattr(error, "retryable", code == "CHAT_EXECUTION_LIMIT_EXCEEDED"))
+        message = response(
+            request,
+            generation_id=str(request["generationId"]),
+            generation_credential=str(request["generationCredential"]),
+            protocol_minor=int(request["protocolMinor"]),
+            error={
+                "code": code,
+                "message": public_message,
+                "retryable": retryable,
+                "details": {},
+            },
+        )
+        self._send(message)
+        ticket.done.set()
+
+    def _send(self, message: Mapping[str, Any]) -> None:
+        self._writer.send(dict(message))
+
+    def _set_fatal(self, error: BaseException) -> None:
+        if not isinstance(error, RouterFailure) and not hasattr(error, "code"):
+            failure = RouterFailure("ROUTER_WORKER_FAILED", "router worker failed")
+            failure.__cause__ = error
+            error = failure
+        with self._lock:
+            if self._fatal is None:
+                self._fatal = error
+                try:
+                    print(
+                        f"Core router failed: {getattr(error, 'code', 'ROUTER_FAILURE')}",
+                        file=sys.stderr,
+                    )
+                except Exception:
+                    pass
+            self._stop.set()
+
+
+__all__ = [
+    "ConcurrentHostRouter",
+    "DISPATCH_QUEUE_LIMIT",
+    "FIXTURE_QUEUE_LIMIT",
+    "FIXTURE_WORKER_COUNT",
+    "RouterFailure",
+]

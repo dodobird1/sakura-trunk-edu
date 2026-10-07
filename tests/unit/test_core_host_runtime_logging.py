@@ -1,0 +1,674 @@
+from __future__ import annotations
+
+import io
+import json
+import logging
+
+import pytest
+
+from app.core.interaction import get_interaction_id, interaction_context
+from app.core.runtime_log import (
+    RUNTIME_LOG_EXTERNAL_ONLY_KEY,
+    diagnostic_attributes,
+    log_event,
+    log_message,
+    suppress_runtime_logs,
+)
+from app.core_host.router import _request_interaction_context
+from app.core_host.runtime_logging import (
+    CORE_BRIDGE_MAX_LINE_BYTES,
+    CORE_BRIDGE_PREFIX,
+    RuntimeLoggingBridge,
+    forward_runtime_log_record,
+    install_runtime_logging,
+)
+
+
+PRIVATE_CHAT = "WP4L01 private chat body must never persist"
+PRIVATE_TOOL_ARGUMENT = "WP4L01 tool argument must never persist"
+PRIVATE_SECRET = "sk-WP4L01-PRIVATE-CREDENTIAL"
+
+
+def test_custom_core_messages_share_bridge_and_are_bounded() -> None:
+    stream = io.BytesIO()
+    bridge = install_runtime_logging(stream)
+    try:
+        with interaction_context("custom-operation"):
+            assert log_message("info", "资源加载完成", fields={"elapsed_ms": 320, "nested": {"count": 2}})
+        assert log_message("error", "token=private-secret", fields={"password": "private-password", "path": "C:/private/model"})
+        assert log_message("warning", "长消息" * 1000, fields={"deep": {"a": {"b": {"c": "too deep"}}}})
+    finally:
+        bridge.close()
+    records = _records(stream)
+    assert records[0]["message"] == "资源加载完成"
+    assert records[0]["operation_id"] == "custom-operation"
+    assert records[0]["attributes"]["nested"] == {"count": 2}
+    assert all(r["custom"] for r in records)
+    text = stream.getvalue().decode("utf-8")
+    assert all(private not in text for private in ("private-secret", "private-password", "too deep"))
+    assert "truncated" in text
+    assert all(len(line) + 1 <= CORE_BRIDGE_MAX_LINE_BYTES for line in stream.getvalue().splitlines())
+
+
+def test_missing_host_sink_never_opens_a_fallback_file(monkeypatch) -> None:
+    from pathlib import Path
+    monkeypatch.setattr(Path, "open", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("file write")))
+    assert log_message("info", "没有宿主时丢弃") is False
+    log_event("APP", "Sakura startup", event="core.process.started")
+
+
+@pytest.mark.parametrize("value", [12, "字段" * 100])
+def test_custom_field_budget_is_stable_across_sdk_and_core_cleaning(value) -> None:
+    from app.plugins.sakura_plugin_sdk import prepare_log_payload
+
+    message, fields = prepare_log_payload(
+        "诊断元数据", {"api_key": "private-budget-secret", **{f"metric_{i}": value for i in range(40)}},
+    )
+    assert fields["record_truncated"] is True
+    assert fields["api_key"] == "[REDACTED]"
+    assert len(fields) <= 32  # 31 ordinary scalar fields plus the marker.
+    assert len(json.dumps(fields, ensure_ascii=False).encode("utf-8")) <= 1800
+    assert prepare_log_payload(message, fields) == (message, fields)
+    stream = io.BytesIO()
+    bridge = install_runtime_logging(stream)
+    try:
+        assert log_message("warning", message, fields=fields)
+    finally:
+        bridge.close()
+    assert _records(stream)[0]["attributes"] == fields
+
+
+def _records(stream: io.BytesIO) -> list[dict[str, object]]:
+    records = []
+    for line in stream.getvalue().splitlines():
+        if line.startswith(CORE_BRIDGE_PREFIX):
+            records.append(json.loads(line.removeprefix(CORE_BRIDGE_PREFIX)))
+    return records
+
+
+def test_startup_failure_keeps_its_event_and_original_migration_cause() -> None:
+    from app.core_host.assistant_adapter import report_assistant_failure
+
+    stream = io.BytesIO()
+    bridge = install_runtime_logging(stream)
+    try:
+        try:
+            try:
+                raise OSError("dependency installation was interrupted")
+            except OSError as cause:
+                raise RuntimeError("插件恢复失败（sakura.memory.mem0）") from cause
+        except RuntimeError as error:
+            report_assistant_failure(error, stage="plugin_application", code="ASSISTANT_INITIALIZATION_FAILED")
+    finally:
+        bridge.close()
+    record = _records(stream)[0]
+    assert record["event"] == "assistant.initialization.failed"
+    assert record["attributes"]["stage"] == "plugin_application"
+    assert record["attributes"]["reason_code"] == "ASSISTANT_INITIALIZATION_FAILED"
+    assert "sakura.memory.mem0" in record["attributes"]["exception_chain"]
+    assert "dependency installation was interrupted" in record["attributes"]["diagnostic"]
+
+
+def test_core_bridge_forwards_suppressed_log_events_without_legacy_outputs(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    stream = io.BytesIO()
+    bridge = install_runtime_logging(stream)
+    monkeypatch.setattr(
+        "app.core.runtime_log.console_log_enabled",
+        lambda: (_ for _ in ()).throw(AssertionError("Legacy debug settings were read")),
+    )
+    try:
+        with interaction_context("operation-wp-4l-01"), suppress_runtime_logs():
+            log_event(
+                "AgentRuntime",
+                "开始处理用户消息",
+                {
+                    "content": PRIVATE_CHAT,
+                    "arguments": {"query": PRIVATE_TOOL_ARGUMENT},
+                    "api_key": PRIVATE_SECRET,
+                    "tool_name": "memory.search",
+                    "elapsed_ms": 12,
+                },
+            )
+    finally:
+        bridge.close()
+
+    records = _records(stream)
+    event = next(record for record in records if record["event"] == "agent.turn.started")
+    assert event["operation_id"] == "operation-wp-4l-01"
+    assert event["message"] == "Assistant turn started"
+    assert event["attributes"] == {"tool_name": "memory.search", "elapsed_ms": 12}
+    serialized = stream.getvalue().decode("utf-8")
+    assert PRIVATE_CHAT not in serialized
+    assert PRIVATE_TOOL_ARGUMENT not in serialized
+    assert PRIVATE_SECRET not in serialized
+
+
+def test_context_budget_failure_keeps_only_the_numeric_breakdown() -> None:
+    stream = io.BytesIO()
+    bridge = install_runtime_logging(stream)
+    try:
+        with interaction_context("chat-context-budget-1"), suppress_runtime_logs():
+            log_event(
+                "Chat",
+                "对话请求失败",
+                {
+                    "code": "CONTEXT_WINDOW_EXCEEDED",
+                    "reason_code": "CONTEXT_WINDOW_EXCEEDED",
+                    "detail_stage": "window_capacity",
+                    "context_window_tokens": 131_072,
+                    "context_window_source": "user",
+                    "input_target": 0,
+                    "required_tokens": 4_000,
+                    "static_prompt_tokens": 2_000,
+                    "tool_schema_tokens": 500,
+                    "current_required_tokens": 1_500,
+                    "required_context_tokens": 0,
+                    "output_reserve": 131_072,
+                    "safety_margin": 6_554,
+                    "diagnostic": "本地上下文预算不足。",
+                    "content": PRIVATE_CHAT,
+                },
+                event="chat.request.failed",
+                severity="error",
+                verbosity=0,
+            )
+    finally:
+        bridge.close()
+
+    event = _records(stream)[0]
+    assert event["event"] == "chat.request.failed"
+    assert event["operation_id"] == "chat-context-budget-1"
+    assert event["attributes"] == {
+        "code": "CONTEXT_WINDOW_EXCEEDED",
+        "reason_code": "CONTEXT_WINDOW_EXCEEDED",
+        "detail_stage": "window_capacity",
+        "context_window_tokens": 131_072,
+        "context_window_source": "user",
+        "input_target": 0,
+        "required_tokens": 4_000,
+        "static_prompt_tokens": 2_000,
+        "tool_schema_tokens": 500,
+        "current_required_tokens": 1_500,
+        "required_context_tokens": 0,
+        "output_reserve": 131_072,
+        "safety_margin": 6_554,
+        "diagnostic": "本地上下文预算不足。",
+    }
+    assert PRIVATE_CHAT not in stream.getvalue().decode("utf-8")
+
+
+def test_external_only_mode_drops_when_bridge_is_absent(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv(RUNTIME_LOG_EXTERNAL_ONLY_KEY, "1")
+
+    log_event("TTS", "发送 GPT-SoVITS 请求", {"text_chars": 4})
+
+
+def test_router_chat_operation_context_is_scoped_and_content_derived_events_are_removed() -> None:
+    stream = io.BytesIO()
+    bridge = install_runtime_logging(stream)
+    try:
+        assert get_interaction_id() == ""
+        with _request_interaction_context({"name": "chat.send", "id": "operation-router-1"}):
+            assert get_interaction_id() == "operation-router-1"
+            log_event("PrivateChannel", PRIVATE_CHAT, {"status": "completed"})
+        assert get_interaction_id() == ""
+    finally:
+        bridge.close()
+
+    serialized = stream.getvalue().decode("utf-8")
+    assert PRIVATE_CHAT not in serialized
+    record = _records(stream)[0]
+    assert record["channel"] == "core.runtime"
+    assert record["event"] == "core.runtime.event"
+    assert record["operation_id"] == "operation-router-1"
+
+
+def test_app_logging_handler_preserves_error_and_redacts_credentials() -> None:
+    stream = io.BytesIO()
+    bridge = install_runtime_logging(stream)
+    logger = logging.getLogger("app.core.private_boundary")
+    try:
+        try:
+            raise RuntimeError("original filesystem error")
+        except RuntimeError:
+            logger.exception("%s %s", "original filesystem error", PRIVATE_SECRET)
+    finally:
+        bridge.close()
+
+    serialized = stream.getvalue().decode("utf-8")
+    assert "original filesystem error" in serialized
+    assert PRIVATE_SECRET not in serialized
+    event = next(record for record in _records(stream) if record["event"] == "python.logging.error")
+    assert event["message"] == "Python application error"
+    assert event["attributes"]["category"] == "RuntimeError"
+    assert event["attributes"]["code"] == "PYTHON_EXCEPTION"
+    assert "exception_stack" in event["attributes"]
+
+
+def test_exception_diagnostics_add_safe_root_cause_location() -> None:
+    try:
+        try:
+            raise OSError("original filesystem error")
+        except OSError as cause:
+            raise RuntimeError(PRIVATE_SECRET) from cause
+    except RuntimeError as error:
+        attributes = diagnostic_attributes(
+            error,
+            reason_code="FIXTURE_FAILED",
+            stage="fixture",
+        )
+
+    assert attributes["error_type"] == "RuntimeError"
+    assert attributes["cause_type"] == "OSError"
+    assert ":test_exception_diagnostics_add_safe_root_cause_location:" in attributes["exception_site"]
+    assert "failure_id" not in attributes
+    assert "original filesystem error" not in str(attributes["exception_site"])
+
+    stream = io.BytesIO()
+    bridge = install_runtime_logging(stream)
+    try:
+        log_event(
+            "Chat",
+            "对话请求失败",
+            attributes,
+            event="chat.request.failed",
+            severity="error",
+        )
+    finally:
+        bridge.close()
+    forwarded = _records(stream)[0]["attributes"]
+    assert forwarded["cause_type"] == "OSError"
+    assert forwarded["exception_site"] == attributes["exception_site"]
+    assert "failure_id" not in forwarded
+    assert "original filesystem error" in stream.getvalue().decode("utf-8")
+    assert PRIVATE_SECRET not in stream.getvalue().decode("utf-8")
+
+
+def test_unhandled_transport_error_uses_only_stable_safe_diagnostic() -> None:
+    from app.core_host.server import WriterError
+
+    stream = io.BytesIO()
+    bridge = install_runtime_logging(stream)
+    try:
+        bridge.emit_unhandled(
+            "CORE_HOST_TRANSPORT_ERROR",
+            WriterError("TRANSPORT_WRITE_FAILED", "original filesystem error"),
+        )
+    finally:
+        bridge.close()
+
+    event = _records(stream)[0]
+    assert event["attributes"]["code"] == "CORE_HOST_TRANSPORT_ERROR"
+    assert event["attributes"]["cause_type"] == "WriterError"
+    assert "original filesystem error" in event["attributes"]["diagnostic"]
+    assert "original filesystem error" in stream.getvalue().decode("utf-8")
+
+
+def test_unhandled_transport_error_can_recover_only_a_stable_code_prefix() -> None:
+    stream = io.BytesIO()
+    bridge = install_runtime_logging(stream)
+    try:
+        bridge.emit_unhandled(
+            "CORE_HOST_TRANSPORT_ERROR",
+            RuntimeError("SHUTDOWN_DURING_INITIALIZE: original filesystem error"),
+        )
+    finally:
+        bridge.close()
+
+    event = _records(stream)[0]
+    assert event["attributes"]["error_type"] == "RuntimeError"
+    assert "SHUTDOWN_DURING_INITIALIZE: original filesystem error" in event["attributes"]["diagnostic"]
+    assert "original filesystem error" in stream.getvalue().decode("utf-8")
+
+
+def test_bridge_queue_evicts_low_priority_and_aggregates_drops() -> None:
+    stream = io.BytesIO()
+    bridge = RuntimeLoggingBridge(stream, capacity=2, start_worker=False)
+    assert bridge.emit_fixed(severity="info", channel="test", event="test.info.1")
+    assert bridge.emit_fixed(severity="debug", channel="test", event="test.info.2")
+    assert bridge.emit_fixed(severity="error", channel="test", event="test.error")
+    assert len(bridge._pending) == 2  # noqa: SLF001 - deterministic queue contract test
+    assert any(item.severity == "error" for item in bridge._pending)  # noqa: SLF001
+    assert sum(bridge._dropped.values()) == 1  # noqa: SLF001
+    summary = json.loads(  # noqa: SLF001
+        bridge._drop_summary().line.strip().removeprefix(CORE_BRIDGE_PREFIX)
+    )
+    assert summary["attributes"] == {
+        "dropped_count": 1,
+        "counts": {"fixed.info": 1},
+    }
+    assert bridge.close()
+
+
+def test_bridge_records_are_bounded_and_unknown_attributes_are_removed() -> None:
+    stream = io.BytesIO()
+    bridge = install_runtime_logging(stream)
+    try:
+        bridge.emit_fixed(
+            severity="warning",
+            channel="core.test",
+            event="core.test.bounded",
+            attributes={
+                "status": "x" * 10_000,
+                "arbitrary": PRIVATE_CHAT,
+                "body": PRIVATE_TOOL_ARGUMENT,
+                "record_bytes": 10_000,
+            },
+            operation_id="operation-1",
+        )
+    finally:
+        bridge.close()
+    lines = stream.getvalue().splitlines(keepends=True)
+    assert lines
+    assert all(len(line) <= CORE_BRIDGE_MAX_LINE_BYTES for line in lines)
+    serialized = stream.getvalue().decode("utf-8")
+    assert PRIVATE_CHAT not in serialized
+    assert PRIVATE_TOOL_ARGUMENT not in serialized
+    record = _records(stream)[0]
+    assert record["attributes"] == {"record_bytes": 10_000}
+
+
+def test_bridge_context_source_ids_preserve_contract_limits_and_reject_non_ids() -> None:
+    stream = io.BytesIO()
+    bridge = install_runtime_logging(stream)
+    valid = {"provider_id": "p" * 200, "plugin_id": "p" * 64}
+    invalid = [
+        {"provider_id": "p" * 201, "plugin_id": "p" * 65},
+        {"provider_id": PRIVATE_SECRET, "plugin_id": "bearer-private"},
+        {"provider_id": "C:/private/rules", "plugin_id": "plugin with spaces"},
+        {"provider_id": {"name": "fixture.rules"}, "plugin_id": ["fixture.plugin"]},
+        {"provider_id": 10, "plugin_id": True},
+        {"provider_id": None, "plugin_id": ""},
+    ]
+    try:
+        for attributes in [valid, *invalid]:
+            bridge.emit_fixed(
+                severity="error",
+                channel="chat",
+                event="chat.request.failed",
+                attributes={"code": "CONTEXT_CONTRIBUTION_FAILED", **attributes},
+            )
+    finally:
+        bridge.close()
+    records = _records(stream)
+    assert records[0]["attributes"] == {"code": "CONTEXT_CONTRIBUTION_FAILED", **valid}
+    assert [record["attributes"] for record in records[1:]] == [
+        {"code": "CONTEXT_CONTRIBUTION_FAILED"} for _ in invalid
+    ]
+    assert PRIVATE_SECRET.encode() not in stream.getvalue()
+
+
+class _BrokenStream:
+    def write(self, _data: bytes) -> int:
+        raise BrokenPipeError
+
+    def flush(self) -> None:
+        return None
+
+
+def test_broken_stderr_is_isolated_from_producers() -> None:
+    bridge = RuntimeLoggingBridge(_BrokenStream())
+    assert bridge.emit_fixed(severity="error", channel="core.test", event="core.test.failure")
+    bridge.close()
+    assert bridge.failed
+
+
+def test_business_event_keeps_correlation_and_body_free_prompt_metrics() -> None:
+    stream = io.BytesIO()
+    bridge = install_runtime_logging(stream)
+    try:
+        with interaction_context("chat-1234567890"):
+            log_event(
+                "Context",
+                "模型上下文已构建",
+                {
+                    "trace_id": "17",
+                    "model_call": 2,
+                    "purpose": "agent_step",
+                    "model": "example-model",
+                    "history_messages": 8,
+                    "memories": 3,
+                    "tool_count": 18,
+                    "estimated_tokens": 11684,
+                    "content": PRIVATE_CHAT,
+                },
+                event="context.prompt.prepared",
+                verbosity=1,
+            )
+    finally:
+        bridge.close()
+
+    event = _records(stream)[0]
+    assert event["severity"] == "info"
+    assert event["channel"] == "context"
+    assert event["event"] == "context.prompt.prepared"
+    assert event["operation_id"] == "chat-1234567890"
+    assert event["trace_id"] == "17"
+    assert event["attributes"] == {
+        "model_call": 2,
+        "purpose": "agent_step",
+        "model": "example-model",
+        "history_messages": 8,
+        "memories": 3,
+        "tool_count": 18,
+        "estimated_tokens": 11684,
+    }
+    assert PRIVATE_CHAT not in stream.getvalue().decode("utf-8")
+
+
+def test_prompt_dependency_degradation_keeps_safe_root_cause() -> None:
+    stream = io.BytesIO()
+    bridge = RuntimeLoggingBridge(stream, start_worker=False)
+    bridge.install()
+    try:
+        with interaction_context("chat-dependency-1"):
+            log_event(
+                "Context",
+                "Prompt 依赖未就绪，继续降级对话",
+                {
+                    "dependency": "memory",
+                    "status": "degraded",
+                    "reason_code": "PROCESS_EXITED",
+                    "stage": "process_exit",
+                    "category": "process_exited",
+                    "error_type": "ChildProcessExit",
+                    "elapsed_ms": 5021,
+                    "message": PRIVATE_CHAT,
+                },
+            )
+    finally:
+        bridge.close()
+        while bridge._pending:  # noqa: SLF001 - deterministic bridge projection
+            stream.write(bridge._pending.popleft().line)  # noqa: SLF001
+
+    event = _records(stream)[0]
+    assert event["event"] == "context.dependencies.degraded"
+    assert event["operation_id"] == "chat-dependency-1"
+    assert event["attributes"] == {
+        "dependency": "memory",
+        "status": "degraded",
+        "reason_code": "PROCESS_EXITED",
+        "stage": "process_exit",
+        "category": "process_exited",
+        "error_type": "ChildProcessExit",
+        "elapsed_ms": 5021,
+    }
+    assert PRIVATE_CHAT not in stream.getvalue().decode("utf-8")
+
+
+def test_unknown_info_event_is_not_promoted_to_user_visible_info() -> None:
+    stream = io.BytesIO()
+    bridge = install_runtime_logging(stream)
+    try:
+        log_event("Plugin", "内部握手细节", event="plugin.internal.handshake")
+    finally:
+        bridge.close()
+
+    event = _records(stream)[0]
+    assert event["event"] == "core.runtime.event"
+    assert event["severity"] in {"debug", "trace"}
+    assert event["message"] == "Core internal diagnostic"
+
+
+def test_tts_business_event_keeps_text_size_without_text() -> None:
+    stream = io.BytesIO()
+    bridge = install_runtime_logging(stream)
+    try:
+        with interaction_context("chat-tts-1"):
+            log_event(
+                "TTS",
+                "发送 GPT-SoVITS 请求",
+                {"text": PRIVATE_CHAT, "provider": "gpt_sovits"},
+            )
+    finally:
+        bridge.close()
+
+    event = _records(stream)[0]
+    assert event["event"] == "tts.request.started"
+    assert event["operation_id"] == "chat-tts-1"
+    assert event["attributes"] == {
+        "provider": "gpt_sovits",
+        "text_chars": len(PRIVATE_CHAT),
+    }
+    assert PRIVATE_CHAT not in stream.getvalue().decode("utf-8")
+
+
+def test_forwarded_worker_record_uses_only_active_sink_and_reapplies_safety(
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    forwarded = {
+        "severity": "info",
+        "verbosity": "info",
+        "channel": "tts",
+        "event": "tts.request.started",
+        "message": "untrusted worker message",
+        "operation_id": "chat-worker-1",
+        "attributes": {
+            "provider": "gpt_sovits",
+            "text_chars": 41,
+            "attempt": 1,
+            "text": PRIVATE_CHAT,
+            "authorization": PRIVATE_SECRET,
+            "api_url": "http://127.0.0.1:9880/tts",
+            "weights_path": r"D:\private\voice.pth",
+        },
+    }
+
+    assert forward_runtime_log_record(forwarded) is False
+
+    stream = io.BytesIO()
+    bridge = install_runtime_logging(stream)
+    try:
+        assert forward_runtime_log_record(forwarded) is True
+        assert forward_runtime_log_record(
+            {
+                **forwarded,
+                "severity": "error",
+                "verbosity": "error",
+                "event": "tts.private.unknown",
+            }
+        )
+        assert not forward_runtime_log_record({**forwarded, "unexpected": True})
+        assert not forward_runtime_log_record({**forwarded, "severity": []})
+        assert not forward_runtime_log_record(
+            {**forwarded, "attributes": {"diagnostic": "x" * CORE_BRIDGE_MAX_LINE_BYTES}}
+        )
+    finally:
+        bridge.close()
+
+    records = _records(stream)
+    event = records[0]
+    assert event["event"] == "tts.request.started"
+    assert event["operation_id"] == "chat-worker-1"
+    assert event["message"] == "TTS synthesis started"
+    assert event["attributes"] == {
+        "provider": "gpt_sovits",
+        "text_chars": 41,
+        "attempt": 1,
+    }
+    persisted = stream.getvalue().decode("utf-8")
+    assert records[1]["event"] == "core.runtime.event"
+    assert records[1]["severity"] in {"debug", "trace"}
+    assert "127.0.0.1" not in persisted
+    assert "voice.pth" not in persisted
+    assert PRIVATE_CHAT not in persisted
+    assert PRIVATE_SECRET not in persisted
+
+
+def test_api_failure_keeps_bounded_diagnostic_but_redacts_credentials() -> None:
+    stream = io.BytesIO()
+    bridge = install_runtime_logging(stream)
+    try:
+        log_event(
+            "API",
+            "HTTP 请求失败",
+            {
+                "status": 401,
+                "provider_error_type": "authentication_error",
+                "provider_error_code": "invalid_api_key",
+                "diagnostic": (
+                    "Invalid authentication credentials; Authorization: Bearer "
+                    f"{PRIVATE_SECRET}; token=visible"
+                ),
+                "content": PRIVATE_CHAT,
+            },
+            event="api.request.failed",
+            severity="warning",
+            verbosity=0,
+        )
+    finally:
+        bridge.close()
+
+    serialized = stream.getvalue().decode("utf-8")
+    event = _records(stream)[0]
+    assert event["attributes"]["provider_error_type"] == "authentication_error"
+    assert event["attributes"]["provider_error_code"] == "invalid_api_key"
+    assert "Invalid authentication credentials" in event["attributes"]["diagnostic"]
+    assert "[REDACTED]" in event["attributes"]["diagnostic"]
+    assert PRIVATE_SECRET not in serialized
+    assert "token=visible" not in serialized
+    assert PRIVATE_CHAT not in serialized
+
+
+def test_chat_terminals_keep_their_event_identity_and_duration_on_the_core_bridge() -> None:
+    stream = io.BytesIO()
+    bridge = install_runtime_logging(stream)
+    try:
+        for outcome in ("success", "failed", "cancelled"):
+            log_event("Chat", "对话已结束", {
+                "operation_id": "chat-1", "outcome": outcome, "elapsed_ms": 123,
+            }, event="chat.finished", severity="info")
+    finally:
+        bridge.close()
+    records = _records(stream)
+    assert len(records) == 3
+    assert [r["attributes"]["outcome"] for r in records] == ["success", "failed", "cancelled"]
+    assert all(r["event"] == "chat.finished" and r["severity"] == "info" for r in records)
+    assert all(r["operation_id"] == "chat-1" and r["attributes"]["elapsed_ms"] == 123 for r in records)
+
+
+def test_plugin_startup_phases_and_timeout_context_reach_the_core_bridge() -> None:
+    stream = io.BytesIO()
+    bridge = install_runtime_logging(stream)
+    try:
+        log_event("Plugin", "插件启动阶段完成", {
+            "stage": "import", "duration_ms": 120, "elapsed_ms": 150,
+        }, event="plugin.start.phase.completed", severity="info", verbosity=1,
+            plugin_id="sakura.model.openai_compatible")
+        log_event("Plugin", "插件启动失败", {
+            "stage": "initialize", "detail_stage": "setup", "service_key": "sakura.host.logging",
+            "startup_snapshot": "available", "timeout_ms": 8000, "elapsed_ms": 8001,
+            "duration_ms": 7851, "child_pid": 42, "process_alive": True,
+            "command": "emit", "diagnostic": "PLUGIN_CALL_TIMEOUT",
+        }, event="plugin.start.failed", severity="error", verbosity=0)
+    finally:
+        bridge.close()
+    phase, failure = _records(stream)
+    assert phase["event"] == "plugin.start.phase.completed"
+    assert phase["severity"] == "info"
+    assert phase["plugin_id"] == "sakura.model.openai_compatible"
+    assert phase["attributes"]["duration_ms"] == 120
+    assert failure["attributes"]["service_key"] == "sakura.host.logging"
+    assert failure["attributes"]["startup_snapshot"] == "available"
+    assert failure["attributes"]["detail_stage"] == "setup"
+    assert failure["attributes"]["timeout_ms"] == 8000

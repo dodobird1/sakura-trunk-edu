@@ -1,0 +1,2017 @@
+use std::{
+    error::Error as StdError,
+    ffi::OsString,
+    path::Path,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+
+use crate::download_sources::{self, DownloadSources};
+use serde::Serialize;
+use serde_json::{json, Map, Value};
+use tauri::Manager;
+use tauri::{AppHandle, Emitter, State, WebviewWindow};
+use tauri_plugin_updater::{Error as UpdaterError, UpdaterExt};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+
+use crate::{
+    chat_bridge::{self, ChatEventPublication},
+    product_shell,
+    runtime_log::{RuntimeLogEvent, RuntimeLogService, Severity},
+    shell_lifecycle::ShellLifecycleState,
+    ui_config::UiConfigRepository,
+};
+
+pub const REPOSITORY_URL: &str = "https://github.com/Rvosy/Sakura";
+pub const WEBSITE_URL: &str = "https://sakura.cialloo.cn/";
+pub const CHANGELOG_URL: &str = "https://github.com/Rvosy/Sakura/blob/main/docs/CHANGELOG.md";
+pub const SPONSOR_URL: &str = "https://ifdian.net/a/Rvosy";
+pub const UPDATE_PREFERENCES_CHANGED_EVENT: &str = "sakura://update-preferences-changed";
+const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
+const UPDATE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const UPDATE_NOTES_LIMIT: usize = 4000;
+const UPDATE_ERROR_CHAIN_LIMIT: usize = 8;
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AboutSnapshot {
+    schema_version: u32,
+    version: String,
+    repository_url: &'static str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateSnapshot {
+    schema_version: u32,
+    current_version: String,
+    mode: &'static str,
+    available: bool,
+    version: Option<String>,
+    notes: Option<String>,
+    pub_date: Option<String>,
+    download_url: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdatePreferencesSnapshot {
+    schema_version: u32,
+    auto_check_enabled: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartupUpdateSnapshot {
+    schema_version: u32,
+    status: String,
+    version: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct UpdatePreferences {
+    auto_check_enabled: bool,
+    last_announced_version: Option<String>,
+    last_announced_local_date: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct UpdateCandidate {
+    snapshot: UpdateSnapshot,
+}
+
+impl UpdateCandidate {
+    fn version(&self) -> &str {
+        self.snapshot.version.as_deref().unwrap_or_default()
+    }
+
+    fn event(&self) -> Value {
+        json!({
+            "type": "update_available",
+            "payload": {
+                "currentVersion": self.snapshot.current_version,
+                "version": self.snapshot.version,
+                "notes": self.snapshot.notes,
+                "pubDate": self.snapshot.pub_date,
+                "mode": self.snapshot.mode,
+            }
+        })
+    }
+}
+
+#[derive(Default)]
+struct UpdateCoordinatorState {
+    check_attempted: bool,
+    checked_snapshot: Option<UpdateSnapshot>,
+    candidate: Option<UpdateCandidate>,
+    status: String,
+}
+
+#[derive(Clone)]
+pub struct UpdateCoordinator {
+    repository: UiConfigRepository,
+    state: Arc<Mutex<UpdateCoordinatorState>>,
+}
+
+impl UpdateCoordinator {
+    pub fn new(repository: UiConfigRepository) -> Self {
+        Self {
+            repository,
+            state: Arc::new(Mutex::new(UpdateCoordinatorState::default())),
+        }
+    }
+
+    pub fn preferences(&self) -> Result<UpdatePreferencesSnapshot, String> {
+        let preferences = load_preferences(&self.repository)?;
+        Ok(UpdatePreferencesSnapshot {
+            schema_version: 1,
+            auto_check_enabled: preferences.auto_check_enabled,
+        })
+    }
+
+    pub fn checked_snapshot(&self) -> Result<Option<UpdateSnapshot>, String> {
+        self.state
+            .lock()
+            .map_err(|source_error| {
+                crate::runtime_log::diagnostic_error("UPDATE_COORDINATOR_UNAVAILABLE", source_error)
+            })
+            .map(|state| state.checked_snapshot.clone())
+    }
+
+    pub fn set_auto_check_enabled(
+        &self,
+        enabled: bool,
+    ) -> Result<UpdatePreferencesSnapshot, String> {
+        save_preferences(&self.repository, |preferences| {
+            preferences.auto_check_enabled = enabled;
+        })?;
+        if !enabled {
+            self.state
+                .lock()
+                .map_err(|source_error| {
+                    crate::runtime_log::diagnostic_error(
+                        "UPDATE_COORDINATOR_UNAVAILABLE",
+                        source_error,
+                    )
+                })?
+                .candidate = None;
+        }
+        self.preferences()
+    }
+
+    pub async fn startup_check(
+        &self,
+        app: &AppHandle,
+        executable_directory: &Path,
+        runtime_log: &RuntimeLogService,
+    ) -> StartupUpdateSnapshot {
+        let mut preferences = match load_preferences(&self.repository) {
+            Ok(preferences) => preferences,
+            Err(_) => return startup_snapshot("unavailable", None),
+        };
+        if !preferences.auto_check_enabled {
+            if let Ok(mut state) = self.state.lock() {
+                state.candidate = None;
+                state.status = "disabled".to_string();
+            }
+            return startup_snapshot("disabled", None);
+        }
+
+        let cached = self.state.lock().ok().and_then(|state| {
+            state
+                .check_attempted
+                .then(|| state.checked_snapshot.clone())
+        });
+        let checked = match cached {
+            Some(snapshot) => snapshot,
+            None => {
+                if let Ok(mut state) = self.state.lock() {
+                    if state.check_attempted {
+                        return startup_snapshot(
+                            if state.status.is_empty() {
+                                "unavailable"
+                            } else {
+                                &state.status
+                            },
+                            state.candidate.as_ref().map(|value| value.version()),
+                        );
+                    }
+                    state.check_attempted = true;
+                }
+                match check(app, executable_directory, runtime_log, "startup").await {
+                    Ok(snapshot) => {
+                        if let Ok(mut state) = self.state.lock() {
+                            state.checked_snapshot = Some(snapshot.clone());
+                        }
+                        Some(snapshot)
+                    }
+                    Err(_) => {
+                        if let Ok(mut state) = self.state.lock() {
+                            state.status = "unavailable".to_string();
+                        }
+                        return startup_snapshot("unavailable", None);
+                    }
+                }
+            }
+        };
+        let Some(snapshot) = checked else {
+            return startup_snapshot("unavailable", None);
+        };
+        preferences = match load_preferences(&self.repository) {
+            Ok(preferences) => preferences,
+            Err(_) => return startup_snapshot("unavailable", None),
+        };
+        if !preferences.auto_check_enabled {
+            if let Ok(mut state) = self.state.lock() {
+                state.candidate = None;
+                state.status = "disabled".to_string();
+            }
+            return startup_snapshot("disabled", None);
+        }
+        if !snapshot.available {
+            if let Ok(mut state) = self.state.lock() {
+                state.candidate = None;
+                state.status = "up_to_date".to_string();
+            }
+            return startup_snapshot("up_to_date", None);
+        }
+        let version = snapshot.version.clone().unwrap_or_default();
+        let today = local_date();
+        if !announcement_due(&preferences, &version, &today) {
+            if let Ok(mut state) = self.state.lock() {
+                state.candidate = None;
+                state.status = "already_announced".to_string();
+            }
+            return startup_snapshot("already_announced", Some(&version));
+        }
+        if let Ok(mut state) = self.state.lock() {
+            state.candidate = Some(UpdateCandidate {
+                snapshot: snapshot.clone(),
+            });
+            state.status = "pending".to_string();
+        }
+        startup_snapshot("pending", Some(&version))
+    }
+
+    pub fn pending_event(&self) -> Result<(Value, String), String> {
+        let state = self.state.lock().map_err(|source_error| {
+            crate::runtime_log::diagnostic_error("UPDATE_COORDINATOR_UNAVAILABLE", source_error)
+        })?;
+        let candidate = state
+            .candidate
+            .as_ref()
+            .ok_or_else(|| "UPDATE_ANNOUNCEMENT_NOT_PENDING".to_string())?;
+        Ok((candidate.event(), candidate.version().to_string()))
+    }
+
+    pub fn observe_chat_event(&self, event: &ChatEventPublication) -> Result<(), String> {
+        let Some(version) = event.update_version.as_deref() else {
+            return Ok(());
+        };
+        if event.event_type != "chat.completed" {
+            return Ok(());
+        }
+        save_preferences(&self.repository, |preferences| {
+            preferences.last_announced_version = Some(version.to_string());
+            preferences.last_announced_local_date = Some(local_date());
+        })?;
+        let mut state = self.state.lock().map_err(|source_error| {
+            crate::runtime_log::diagnostic_error("UPDATE_COORDINATOR_UNAVAILABLE", source_error)
+        })?;
+        if state
+            .candidate
+            .as_ref()
+            .is_some_and(|candidate| candidate.version() == version)
+        {
+            state.candidate = None;
+            state.status = "announced".to_string();
+        }
+        Ok(())
+    }
+}
+
+pub fn about_snapshot() -> AboutSnapshot {
+    AboutSnapshot {
+        schema_version: 1,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        repository_url: REPOSITORY_URL,
+    }
+}
+
+pub fn is_portable(executable_directory: &Path) -> bool {
+    portable_mode(
+        executable_directory.join("portable.flag").is_file(),
+        cfg!(target_os = "windows"),
+    )
+}
+
+fn portable_mode(has_marker: bool, is_windows: bool) -> bool {
+    has_marker && is_windows
+}
+
+fn portable_download_url(raw: &Value) -> Result<String, String> {
+    let value = raw
+        .get("portable")
+        .and_then(|value| value.get("windows-x86_64"))
+        .and_then(|value| value.get("url"))
+        .and_then(Value::as_str)
+        .filter(|value| value.starts_with("https://") && !value.chars().any(char::is_control))
+        .ok_or_else(|| "PORTABLE_UPDATE_URL_MISSING".to_string())?;
+    Ok(value.to_string())
+}
+
+fn mirrored_updater(app: &AppHandle) -> Result<tauri_plugin_updater::UpdaterBuilder, String> {
+    let sources = app.state::<DownloadSources>().load()?;
+    let mut builder = app.updater_builder().configure_client(|client| {
+        client
+            .connect_timeout(Duration::from_secs(10))
+            .read_timeout(Duration::from_secs(20))
+    });
+    if let Some(endpoints) = app
+        .config()
+        .plugins
+        .0
+        .get("updater")
+        .and_then(|value| value["endpoints"].as_array())
+    {
+        let mut resolved = Vec::new();
+        for endpoint in endpoints {
+            let url = download_sources::https_url(
+                endpoint.as_str().ok_or("UPDATE_CONFIGURATION_INVALID")?,
+            )?;
+            resolved.extend(
+                download_sources::candidates(&url, &sources)
+                    .into_iter()
+                    .map(|(_, url)| url),
+            );
+        }
+        if !resolved.is_empty() {
+            builder = builder.endpoints(resolved).map_err(|source_error| {
+                crate::runtime_log::diagnostic_error("UPDATE_CONFIGURATION_INVALID", source_error)
+            })?;
+        }
+    }
+    Ok(builder)
+}
+
+async fn download_update(
+    app: &AppHandle,
+    update: &mut tauri_plugin_updater::Update,
+) -> Result<Vec<u8>, UpdaterError> {
+    let sources = app
+        .state::<DownloadSources>()
+        .load()
+        .map_err(UpdaterError::Network)?;
+    let original = update.download_url.clone();
+    let mut last_error = None;
+    for (name, url) in download_sources::candidates(&original, &sources) {
+        update.download_url = url;
+        let _ = app.emit("sakura://update-download-source", json!({"source": name}));
+        match update.download(|_, _| {}, || {}).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(error) => {
+                // A signature or manifest error must not become a mirror retry.
+                if !matches!(
+                    classify_updater_error(&error, "download"),
+                    "NETWORK" | "HTTP" | "TIMEOUT"
+                ) {
+                    return Err(error);
+                }
+                last_error = Some(error);
+            }
+        }
+    }
+    Err(last_error.unwrap_or(UpdaterError::EmptyEndpoints))
+}
+
+pub async fn check(
+    app: &AppHandle,
+    executable_directory: &Path,
+    runtime_log: &RuntimeLogService,
+    trigger: &'static str,
+) -> Result<UpdateSnapshot, String> {
+    let started = Instant::now();
+    let portable = is_portable(executable_directory);
+    let mode = update_mode(portable);
+    submit_updater_event(
+        runtime_log,
+        Severity::Info,
+        "updater.check.started",
+        "Updater check started",
+        check_started_attributes(trigger, mode),
+    );
+    let updater = mirrored_updater(app)?
+        .timeout(UPDATE_CHECK_TIMEOUT)
+        .build()
+        .map_err(|error| {
+            log_updater_error(
+                runtime_log,
+                "updater.check.failed",
+                "configuration",
+                trigger,
+                mode,
+                "UPDATE_CONFIGURATION_INVALID",
+                &error,
+                started,
+            );
+            "UPDATE_CONFIGURATION_INVALID".to_string()
+        })?;
+    let update = updater.check().await.map_err(|error| {
+        log_updater_error(
+            runtime_log,
+            "updater.check.failed",
+            "check",
+            trigger,
+            mode,
+            "UPDATE_CHECK_FAILED",
+            &error,
+            started,
+        );
+        "UPDATE_CHECK_FAILED".to_string()
+    })?;
+    let Some(update) = update else {
+        let snapshot = no_update_snapshot(portable);
+        log_check_completed(runtime_log, trigger, &snapshot, "up_to_date", started);
+        return Ok(snapshot);
+    };
+    if !stable_release_version(&update.version) {
+        let snapshot = no_update_snapshot(portable);
+        log_check_completed(
+            runtime_log,
+            trigger,
+            &snapshot,
+            "prerelease_ignored",
+            started,
+        );
+        return Ok(snapshot);
+    }
+    let download_url = if portable {
+        Some(portable_download_url(&update.raw_json).map_err(|error| {
+            log_updater_failure(
+                runtime_log,
+                "updater.check.failed",
+                "manifest",
+                trigger,
+                mode,
+                &error,
+                &error,
+                started,
+            );
+            error
+        })?)
+    } else {
+        None
+    };
+    let snapshot = UpdateSnapshot {
+        schema_version: 1,
+        current_version: update.current_version,
+        mode,
+        available: true,
+        version: Some(update.version),
+        notes: bounded_optional_text(update.body, UPDATE_NOTES_LIMIT),
+        pub_date: update.date.and_then(|value| value.format(&Rfc3339).ok()),
+        download_url,
+    };
+    log_check_completed(runtime_log, trigger, &snapshot, "available", started);
+    Ok(snapshot)
+}
+
+fn no_update_snapshot(portable: bool) -> UpdateSnapshot {
+    UpdateSnapshot {
+        schema_version: 1,
+        current_version: env!("CARGO_PKG_VERSION").to_string(),
+        mode: update_mode(portable),
+        available: false,
+        version: None,
+        notes: None,
+        pub_date: None,
+        download_url: None,
+    }
+}
+
+fn stable_release_version(version: &str) -> bool {
+    !version.split('+').next().unwrap_or(version).contains('-')
+}
+
+fn bounded_optional_text(value: Option<String>, limit: usize) -> Option<String> {
+    let value = value?;
+    let clean = value
+        .chars()
+        .filter(|character| !matches!(character, '\0' | '\r'))
+        .take(limit)
+        .collect::<String>();
+    (!clean.trim().is_empty()).then_some(clean)
+}
+
+fn startup_snapshot(status: &str, version: Option<&str>) -> StartupUpdateSnapshot {
+    StartupUpdateSnapshot {
+        schema_version: 1,
+        status: status.to_string(),
+        version: version.map(ToOwned::to_owned),
+    }
+}
+
+fn local_date() -> String {
+    let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
+    format!(
+        "{:04}-{:02}-{:02}",
+        now.year(),
+        u8::from(now.month()),
+        now.day()
+    )
+}
+
+fn announcement_due(preferences: &UpdatePreferences, version: &str, today: &str) -> bool {
+    preferences.last_announced_version.as_deref() != Some(version)
+        || preferences.last_announced_local_date.as_deref() != Some(today)
+}
+
+fn load_preferences(repository: &UiConfigRepository) -> Result<UpdatePreferences, String> {
+    let document = repository.load("UPDATE")?;
+    preferences_from_document(&document)
+}
+
+fn preferences_from_document(document: &Value) -> Result<UpdatePreferences, String> {
+    let settings = validated_settings(document)?;
+    let Some(update) = settings.get("update") else {
+        return Ok(UpdatePreferences {
+            auto_check_enabled: true,
+            last_announced_version: None,
+            last_announced_local_date: None,
+        });
+    };
+    let update = update
+        .as_object()
+        .ok_or_else(|| "UPDATE_SETTINGS_INVALID".to_string())?;
+    let auto_check_enabled = match update.get("auto_check_enabled") {
+        None => true,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => return Err("UPDATE_SETTINGS_INVALID".to_string()),
+    };
+    Ok(UpdatePreferences {
+        auto_check_enabled,
+        last_announced_version: optional_bounded_setting(update, "last_announced_version", 64)?,
+        last_announced_local_date: optional_bounded_setting(
+            update,
+            "last_announced_local_date",
+            10,
+        )?,
+    })
+}
+
+fn save_preferences(
+    repository: &UiConfigRepository,
+    mutate: impl FnOnce(&mut UpdatePreferences),
+) -> Result<(), String> {
+    repository.update("UPDATE", |document| {
+        let mut preferences = preferences_from_document(document)?;
+        mutate(&mut preferences);
+        let settings = validated_settings_mut(document)?;
+        settings.insert(
+            "update".to_string(),
+            json!({
+                "auto_check_enabled": preferences.auto_check_enabled,
+                "last_announced_version": preferences.last_announced_version,
+                "last_announced_local_date": preferences.last_announced_local_date,
+            }),
+        );
+        Ok(())
+    })
+}
+
+fn validated_settings(document: &Value) -> Result<&Map<String, Value>, String> {
+    if document.get("schema_version").and_then(Value::as_u64) != Some(1)
+        || document.get("domain").and_then(Value::as_str) != Some("ui")
+    {
+        return Err("UPDATE_SETTINGS_INVALID".to_string());
+    }
+    document
+        .get("settings")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "UPDATE_SETTINGS_INVALID".to_string())
+}
+
+fn validated_settings_mut(document: &mut Value) -> Result<&mut Map<String, Value>, String> {
+    if document.get("schema_version").and_then(Value::as_u64) != Some(1)
+        || document.get("domain").and_then(Value::as_str) != Some("ui")
+    {
+        return Err("UPDATE_SETTINGS_INVALID".to_string());
+    }
+    document
+        .get_mut("settings")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| "UPDATE_SETTINGS_INVALID".to_string())
+}
+
+fn optional_bounded_setting(
+    mapping: &Map<String, Value>,
+    key: &str,
+    limit: usize,
+) -> Result<Option<String>, String> {
+    match mapping.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value))
+            if !value.is_empty()
+                && value.len() <= limit
+                && !value.chars().any(char::is_control) =>
+        {
+            Ok(Some(value.clone()))
+        }
+        Some(_) => Err("UPDATE_SETTINGS_INVALID".to_string()),
+    }
+}
+
+pub async fn install(
+    app: &AppHandle,
+    executable_directory: &Path,
+    runtime_log: &RuntimeLogService,
+    prepare_windows_exit: impl FnOnce() -> Result<(), String> + Send + 'static,
+) -> Result<(), String> {
+    let operation_started = Instant::now();
+    if is_portable(executable_directory) {
+        log_updater_failure(
+            runtime_log,
+            "updater.install.failed",
+            "mode",
+            "install",
+            "portable",
+            "PORTABLE_UPDATE_MANUAL_REQUIRED",
+            "Portable updates require a manual download.",
+            operation_started,
+        );
+        return Err("PORTABLE_UPDATE_MANUAL_REQUIRED".to_string());
+    }
+    let mode = "installed";
+    let check_started = Instant::now();
+    submit_updater_event(
+        runtime_log,
+        Severity::Info,
+        "updater.check.started",
+        "Updater check started",
+        check_started_attributes("install", mode),
+    );
+    let updater = mirrored_updater(app)?
+        .timeout(UPDATE_CHECK_TIMEOUT)
+        .build()
+        .map_err(|error| {
+            log_updater_error(
+                runtime_log,
+                "updater.install.failed",
+                "configuration",
+                "install",
+                mode,
+                "UPDATE_CONFIGURATION_INVALID",
+                &error,
+                operation_started,
+            );
+            "UPDATE_CONFIGURATION_INVALID".to_string()
+        })?;
+    let mut update = updater
+        .check()
+        .await
+        .map_err(|error| {
+            log_updater_error(
+                runtime_log,
+                "updater.install.failed",
+                "check",
+                "install",
+                mode,
+                "UPDATE_CHECK_FAILED",
+                &error,
+                operation_started,
+            );
+            "UPDATE_CHECK_FAILED".to_string()
+        })?
+        .ok_or_else(|| {
+            log_updater_failure(
+                runtime_log,
+                "updater.install.failed",
+                "check",
+                "install",
+                mode,
+                "UPDATE_NOT_AVAILABLE",
+                "No update is available.",
+                operation_started,
+            );
+            "UPDATE_NOT_AVAILABLE".to_string()
+        })?;
+    if !stable_release_version(&update.version) {
+        log_updater_failure(
+            runtime_log,
+            "updater.install.failed",
+            "check",
+            "install",
+            mode,
+            "UPDATE_NOT_AVAILABLE",
+            "Only stable updater releases can be installed.",
+            operation_started,
+        );
+        return Err("UPDATE_NOT_AVAILABLE".to_string());
+    }
+    // UpdaterBuilder propagates its request timeout to the returned Update.
+    // Keep manifest checks bounded to ten seconds, but allow large signed
+    // installers to finish on slower connections.
+    update.timeout = Some(UPDATE_DOWNLOAD_TIMEOUT);
+    submit_updater_event(
+        runtime_log,
+        Severity::Info,
+        "updater.check.completed",
+        "Updater check completed",
+        json!({
+            "stage": "check",
+            "trigger": "install",
+            "mode": mode,
+            "status": "available",
+            "current_version": update.current_version,
+            "version": update.version,
+            "elapsed_ms": elapsed_ms(check_started),
+        }),
+    );
+    let version = update.version.clone();
+    let download_started = Instant::now();
+    submit_updater_event(
+        runtime_log,
+        Severity::Info,
+        "updater.download.started",
+        "Updater download started",
+        json!({
+            "stage": "download",
+            "trigger": "install",
+            "mode": mode,
+            "version": version,
+        }),
+    );
+    let bytes = download_update(app, &mut update).await.map_err(|error| {
+        let details = updater_error_attributes(&error, "download");
+        log_updater_failure_details(
+            runtime_log,
+            if details["reason_code"] == "SIGNATURE" {
+                "updater.signature.failed"
+            } else {
+                "updater.download.failed"
+            },
+            "download",
+            "install",
+            mode,
+            "UPDATE_DOWNLOAD_FAILED",
+            details,
+            download_started,
+        );
+        "UPDATE_DOWNLOAD_FAILED".to_string()
+    })?;
+    submit_updater_event(
+        runtime_log,
+        Severity::Info,
+        "updater.download.completed",
+        "Updater download completed",
+        json!({
+            "stage": "download",
+            "trigger": "install",
+            "mode": mode,
+            "version": version,
+            "bytes": bytes.len(),
+            "elapsed_ms": elapsed_ms(download_started),
+        }),
+    );
+    let install_started = Instant::now();
+    submit_updater_event(
+        runtime_log,
+        Severity::Info,
+        "updater.install.started",
+        "Updater install started",
+        json!({
+            "stage": "install",
+            "trigger": "install",
+            "mode": mode,
+            "version": version,
+            "bytes": bytes.len(),
+        }),
+    );
+    prepare_installed_update_exit(cfg!(windows), prepare_windows_exit).map_err(|error| {
+        log_updater_failure(
+            runtime_log,
+            "updater.install.failed",
+            "prepare_exit",
+            "install",
+            mode,
+            "UPDATE_INSTALL_PREPARE_FAILED",
+            &error,
+            install_started,
+        );
+        error
+    })?;
+    update.install(bytes).map_err(|error| {
+        log_updater_error(
+            runtime_log,
+            "updater.install.failed",
+            "install",
+            "install",
+            mode,
+            "UPDATE_INSTALL_FAILED",
+            &error,
+            install_started,
+        );
+        "UPDATE_INSTALL_FAILED".to_string()
+    })?;
+    submit_updater_event(
+        runtime_log,
+        Severity::Info,
+        "updater.install.completed",
+        "Updater install completed",
+        json!({
+            "stage": "install",
+            "trigger": "install",
+            "mode": mode,
+            "version": version,
+            "status": "completed",
+            "elapsed_ms": elapsed_ms(install_started),
+        }),
+    );
+    Ok(())
+}
+
+fn update_mode(portable: bool) -> &'static str {
+    if portable {
+        "portable"
+    } else {
+        "installed"
+    }
+}
+
+fn check_started_attributes(trigger: &'static str, mode: &'static str) -> Value {
+    let mut attributes = proxy_environment_snapshot_with(|name| std::env::var_os(name));
+    attributes.insert("stage".to_string(), json!("check"));
+    attributes.insert("trigger".to_string(), json!(trigger));
+    attributes.insert("mode".to_string(), json!(mode));
+    attributes.insert(
+        "current_version".to_string(),
+        json!(env!("CARGO_PKG_VERSION")),
+    );
+    Value::Object(attributes)
+}
+
+fn proxy_environment_snapshot_with(read: impl Fn(&str) -> Option<OsString>) -> Map<String, Value> {
+    let configured = |upper: &str, lower: &str| {
+        read(upper).is_some_and(|value| !value.is_empty())
+            || read(lower).is_some_and(|value| !value.is_empty())
+    };
+    Map::from_iter([
+        ("proxy_mode".to_string(), json!("system_and_environment")),
+        (
+            "proxy_http_configured".to_string(),
+            json!(configured("HTTP_PROXY", "http_proxy")),
+        ),
+        (
+            "proxy_https_configured".to_string(),
+            json!(configured("HTTPS_PROXY", "https_proxy")),
+        ),
+        (
+            "proxy_all_configured".to_string(),
+            json!(configured("ALL_PROXY", "all_proxy")),
+        ),
+        (
+            "proxy_no_proxy_configured".to_string(),
+            json!(configured("NO_PROXY", "no_proxy")),
+        ),
+    ])
+}
+
+fn log_check_completed(
+    runtime_log: &RuntimeLogService,
+    trigger: &'static str,
+    snapshot: &UpdateSnapshot,
+    status: &'static str,
+    started: Instant,
+) {
+    submit_updater_event(
+        runtime_log,
+        Severity::Info,
+        "updater.check.completed",
+        "Updater check completed",
+        json!({
+            "stage": "check",
+            "trigger": trigger,
+            "mode": snapshot.mode,
+            "status": status,
+            "current_version": snapshot.current_version,
+            "version": snapshot.version,
+            "elapsed_ms": elapsed_ms(started),
+        }),
+    );
+}
+
+fn log_updater_failure(
+    runtime_log: &RuntimeLogService,
+    event: &'static str,
+    stage: &'static str,
+    trigger: &'static str,
+    mode: &'static str,
+    code: &str,
+    diagnostic: &str,
+    started: Instant,
+) {
+    log_updater_failure_details(
+        runtime_log,
+        event,
+        stage,
+        trigger,
+        mode,
+        code,
+        Map::from_iter([
+            (
+                "reason_code".to_string(),
+                json!(updater_stage_reason(stage)),
+            ),
+            ("diagnostic".to_string(), json!(diagnostic)),
+        ]),
+        started,
+    );
+}
+
+fn log_updater_error(
+    runtime_log: &RuntimeLogService,
+    event: &'static str,
+    stage: &'static str,
+    trigger: &'static str,
+    mode: &'static str,
+    code: &str,
+    error: &UpdaterError,
+    started: Instant,
+) {
+    log_updater_failure_details(
+        runtime_log,
+        event,
+        stage,
+        trigger,
+        mode,
+        code,
+        updater_error_attributes(error, stage),
+        started,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn log_updater_failure_details(
+    runtime_log: &RuntimeLogService,
+    event: &'static str,
+    stage: &'static str,
+    trigger: &'static str,
+    mode: &'static str,
+    code: &str,
+    mut attributes: Map<String, Value>,
+    started: Instant,
+) {
+    attributes.extend([
+        ("stage".to_string(), json!(stage)),
+        ("trigger".to_string(), json!(trigger)),
+        ("mode".to_string(), json!(mode)),
+        ("code".to_string(), json!(code)),
+        ("error_type".to_string(), json!("tauri_updater")),
+        ("elapsed_ms".to_string(), json!(elapsed_ms(started))),
+    ]);
+    if let Some(timeout) = match stage {
+        "check" => Some(UPDATE_CHECK_TIMEOUT),
+        "download" => Some(UPDATE_DOWNLOAD_TIMEOUT),
+        _ => None,
+    } {
+        attributes.insert("timeout_ms".to_string(), json!(timeout.as_millis() as u64));
+    }
+    // The common runtime-log boundary redacts credentials and bounds diagnostic
+    // strings before persistence and telemetry; preserve source text until then.
+    submit_updater_event(
+        runtime_log,
+        Severity::Error,
+        event,
+        "Updater operation failed",
+        Value::Object(attributes),
+    );
+}
+
+fn submit_updater_event(
+    runtime_log: &RuntimeLogService,
+    severity: Severity,
+    event: &'static str,
+    message: &'static str,
+    attributes: Value,
+) {
+    let _ = runtime_log
+        .submit(RuntimeLogEvent::rust(severity, "updater", event, message).attributes(attributes));
+}
+
+fn updater_stage_reason(stage: &str) -> &'static str {
+    match stage {
+        "configuration" => "CONFIGURATION",
+        "manifest" => "MANIFEST",
+        "download" => "DOWNLOAD_OR_SIGNATURE",
+        "prepare_exit" => "SHUTDOWN",
+        "install" => "INSTALL",
+        "mode" => "MODE",
+        _ => "UNKNOWN",
+    }
+}
+
+fn classify_updater_error(error: &UpdaterError, stage: &str) -> &'static str {
+    match error {
+        UpdaterError::Reqwest(error) => {
+            if error.is_timeout() {
+                "TIMEOUT"
+            } else if error.is_status() {
+                "HTTP"
+            } else if error.is_builder() {
+                "CONFIGURATION"
+            } else if error.is_decode() && matches!(stage, "check" | "manifest") {
+                "MANIFEST"
+            } else {
+                "NETWORK"
+            }
+        }
+        UpdaterError::Io(error) if error.kind() == std::io::ErrorKind::TimedOut => "TIMEOUT",
+        UpdaterError::Serialization(_) | UpdaterError::Semver(_) => "MANIFEST",
+        // The upstream checker discards non-success HTTP statuses and can return
+        // this variant without ever attempting JSON parsing.
+        UpdaterError::ReleaseNotFound => "RELEASE_RESPONSE",
+        UpdaterError::Network(message) if updater_download_status(message).is_some() => "HTTP",
+        UpdaterError::Network(_) => "NETWORK",
+        UpdaterError::Minisign(_) | UpdaterError::Base64(_) | UpdaterError::SignatureUtf8(_) => {
+            "SIGNATURE"
+        }
+        UpdaterError::UnsupportedArch
+        | UpdaterError::UnsupportedOs
+        | UpdaterError::TargetNotFound(_)
+        | UpdaterError::TargetsNotFound(_) => "TARGET",
+        UpdaterError::EmptyEndpoints
+        | UpdaterError::UrlParse(_)
+        | UpdaterError::Http(_)
+        | UpdaterError::InvalidHeaderValue(_)
+        | UpdaterError::InvalidHeaderName(_)
+        | UpdaterError::InsecureTransportProtocol => "CONFIGURATION",
+        _ => updater_stage_reason(stage),
+    }
+}
+
+fn updater_download_status(message: &str) -> Option<u16> {
+    // tauri-plugin-updater 2.10.1 exposes download HTTP errors as this exact
+    // string variant rather than reqwest::Error. Do not infer from arbitrary text.
+    message
+        .strip_prefix("Download request failed with status: ")?
+        .split_whitespace()
+        .next()?
+        .parse::<u16>()
+        .ok()
+        .filter(|status| (100..=599).contains(status))
+}
+
+fn updater_endpoint_alias(url: &reqwest::Url) -> &'static str {
+    match url.host_str() {
+        Some("github.com") if url.path().starts_with("/Rvosy/Sakura/releases/") => "github_release",
+        Some("release-assets.githubusercontent.com" | "objects.githubusercontent.com") => {
+            "github_release_asset"
+        }
+        _ => "other",
+    }
+}
+
+fn updater_error_attributes(error: &UpdaterError, stage: &str) -> Map<String, Value> {
+    let (cause_type, source): (&str, &(dyn StdError + 'static)) = match error {
+        // Transparent variants skip their contained error in Error::source().
+        // Begin there so reqwest/IO facts and their complete source chain survive.
+        UpdaterError::Reqwest(source) => ("Reqwest", source),
+        UpdaterError::Io(source) => ("Io", source),
+        UpdaterError::Serialization(source) => ("Serialization", source),
+        UpdaterError::Semver(_) => ("Semver", error),
+        UpdaterError::ReleaseNotFound => ("ReleaseNotFound", error),
+        UpdaterError::Network(_) => ("Network", error),
+        UpdaterError::Minisign(_) => ("Minisign", error),
+        UpdaterError::Base64(_) => ("Base64", error),
+        UpdaterError::SignatureUtf8(_) => ("SignatureUtf8", error),
+        UpdaterError::UnsupportedArch => ("UnsupportedArch", error),
+        UpdaterError::UnsupportedOs => ("UnsupportedOs", error),
+        UpdaterError::TargetNotFound(_) => ("TargetNotFound", error),
+        UpdaterError::TargetsNotFound(_) => ("TargetsNotFound", error),
+        UpdaterError::EmptyEndpoints => ("EmptyEndpoints", error),
+        UpdaterError::UrlParse(_) => ("UrlParse", error),
+        UpdaterError::Http(_) => ("Http", error),
+        UpdaterError::InvalidHeaderValue(_) => ("InvalidHeaderValue", error),
+        UpdaterError::InvalidHeaderName(_) => ("InvalidHeaderName", error),
+        UpdaterError::InsecureTransportProtocol => ("InsecureTransportProtocol", error),
+        _ => ("Other", error),
+    };
+    let mut attributes = Map::from_iter([
+        (
+            "reason_code".to_string(),
+            json!(classify_updater_error(error, stage)),
+        ),
+        ("cause_type".to_string(), json!(cause_type)),
+        ("diagnostic".to_string(), json!(error.to_string())),
+    ]);
+    let mut chain = Vec::new();
+    let mut next = Some(source);
+    for _ in 0..UPDATE_ERROR_CHAIN_LIMIT {
+        let Some(source) = next else { break };
+        chain.push(source.to_string());
+        if let Some(request) = source.downcast_ref::<reqwest::Error>() {
+            attributes.insert("is_timeout".to_string(), json!(request.is_timeout()));
+            attributes.insert("is_connect".to_string(), json!(request.is_connect()));
+            if let Some(status) = request.status() {
+                attributes.insert("http_status".to_string(), json!(status.as_u16()));
+            }
+            if let Some(url) = request.url() {
+                attributes.insert(
+                    "endpoint_alias".to_string(),
+                    json!(updater_endpoint_alias(url)),
+                );
+            }
+        }
+        if let Some(io) = source.downcast_ref::<std::io::Error>() {
+            attributes.insert(
+                "io_error_kind".to_string(),
+                json!(format!("{:?}", io.kind())),
+            );
+            if let Some(code) = io.raw_os_error() {
+                let field = if cfg!(windows) { "winerror" } else { "errno" };
+                attributes.insert(field.to_string(), json!(code));
+            }
+        }
+        next = source.source();
+    }
+    if next.is_some() {
+        chain.push("[source chain truncated]".to_string());
+    }
+    if chain.len() > 1 {
+        attributes.insert(
+            "exception_chain".to_string(),
+            json!(chain.join("\nCaused by: ")),
+        );
+    }
+    if let UpdaterError::Network(message) = error {
+        if let Some(status) = updater_download_status(message) {
+            attributes.insert("http_status".to_string(), json!(status));
+        }
+    }
+    attributes
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().min(u64::MAX as u128) as u64
+}
+
+fn prepare_installed_update_exit(
+    is_windows: bool,
+    prepare: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    if is_windows {
+        prepare()?;
+    }
+    Ok(())
+}
+
+pub fn open_portable_download(url: &str) -> Result<(), String> {
+    if !url.starts_with("https://") || url.chars().any(char::is_control) {
+        return Err("PORTABLE_UPDATE_URL_INVALID".to_string());
+    }
+    open_https_url(url, "PORTABLE_UPDATE_OPEN_FAILED")
+}
+
+pub fn open_repository() -> Result<(), String> {
+    open_https_url(REPOSITORY_URL, "ABOUT_REPOSITORY_OPEN_FAILED")
+}
+
+pub fn open_website() -> Result<(), String> {
+    open_https_url(WEBSITE_URL, "ABOUT_WEBSITE_OPEN_FAILED")
+}
+
+pub fn open_changelog() -> Result<(), String> {
+    open_https_url(CHANGELOG_URL, "ABOUT_CHANGELOG_OPEN_FAILED")
+}
+
+pub fn open_sponsor() -> Result<(), String> {
+    open_https_url(SPONSOR_URL, "ABOUT_SPONSOR_OPEN_FAILED")
+}
+
+pub(crate) fn open_https_url(url: &str, error_code: &str) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        use windows::core::{w, PCWSTR};
+        use windows::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
+
+        open_windows_https_url(url, error_code, |target| {
+            // Let the HTTPS association select the browser. Explorer treats its
+            // argument as a shell location and may open a folder instead.
+            unsafe {
+                ShellExecuteW(
+                    None,
+                    w!("open"),
+                    PCWSTR(target.as_ptr()),
+                    PCWSTR::null(),
+                    PCWSTR::null(),
+                    SW_SHOWNORMAL,
+                )
+                .0 as isize
+            }
+        })
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        #[cfg(target_os = "macos")]
+        let mut command = std::process::Command::new("open");
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let mut command = std::process::Command::new("xdg-open");
+        command
+            .arg(url)
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| crate::runtime_log::diagnostic_error(error_code, error))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn open_windows_https_url(
+    url: &str,
+    error_code: &str,
+    launch: impl FnOnce(&[u16]) -> isize,
+) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|error| crate::runtime_log::diagnostic_error(error_code, error))?;
+    if parsed.scheme() != "https"
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || url.chars().any(char::is_control)
+    {
+        return Err(error_code.to_string());
+    }
+    let target: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
+    // ShellExecute returns a value greater than 32 on success, not a process handle.
+    if launch(&target) > 32 {
+        Ok(())
+    } else {
+        Err(error_code.to_string())
+    }
+}
+
+fn current_executable_directory() -> Result<std::path::PathBuf, String> {
+    std::env::current_exe()
+        .map_err(|source_error| {
+            crate::runtime_log::diagnostic_error("EXECUTABLE_DIRECTORY_UNAVAILABLE", source_error)
+        })?
+        .parent()
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| "EXECUTABLE_DIRECTORY_UNAVAILABLE".to_string())
+}
+
+#[tauri::command]
+pub(crate) async fn settings_update_get(
+    window: WebviewWindow,
+    app_handle: tauri::AppHandle,
+    runtime_log: State<'_, RuntimeLogService>,
+) -> Result<UpdateSnapshot, String> {
+    product_shell::validate_settings_window(&window)?;
+    check(
+        &app_handle,
+        &current_executable_directory()?,
+        runtime_log.inner(),
+        "manual",
+    )
+    .await
+}
+
+#[tauri::command]
+pub(crate) fn settings_update_cached_get(
+    window: WebviewWindow,
+    coordinator: State<'_, UpdateCoordinator>,
+) -> Result<Option<UpdateSnapshot>, String> {
+    product_shell::validate_settings_window(&window)?;
+    coordinator.checked_snapshot()
+}
+
+#[tauri::command]
+pub(crate) fn settings_update_preferences_get(
+    window: WebviewWindow,
+    coordinator: State<'_, UpdateCoordinator>,
+) -> Result<UpdatePreferencesSnapshot, String> {
+    product_shell::validate_settings_window(&window)?;
+    coordinator.preferences()
+}
+
+#[tauri::command]
+pub(crate) fn settings_update_preferences_set(
+    window: WebviewWindow,
+    app_handle: tauri::AppHandle,
+    coordinator: State<'_, UpdateCoordinator>,
+    auto_check_enabled: bool,
+) -> Result<UpdatePreferencesSnapshot, String> {
+    product_shell::validate_settings_window(&window)?;
+    let snapshot = coordinator.set_auto_check_enabled(auto_check_enabled)?;
+    let _ = app_handle.emit_to("main", UPDATE_PREFERENCES_CHANGED_EVENT, &snapshot);
+    Ok(snapshot)
+}
+
+#[tauri::command]
+pub(crate) async fn startup_update_check(
+    window: WebviewWindow,
+    app_handle: tauri::AppHandle,
+    coordinator: State<'_, UpdateCoordinator>,
+    runtime_log: State<'_, RuntimeLogService>,
+) -> Result<StartupUpdateSnapshot, String> {
+    if window.label() != "main" {
+        return Err("PET_WINDOW_REQUIRED".to_string());
+    }
+    Ok(coordinator
+        .startup_check(
+            &app_handle,
+            &current_executable_directory()?,
+            runtime_log.inner(),
+        )
+        .await)
+}
+
+#[tauri::command]
+pub(crate) async fn chat_update_announce(
+    window: WebviewWindow,
+    on_event: tauri::ipc::Channel<chat_bridge::ChatEventPublication>,
+    lifecycle: State<'_, ShellLifecycleState>,
+    coordinator: State<'_, UpdateCoordinator>,
+) -> Result<chat_bridge::ChatSendPublication, String> {
+    if window.label() != "main" {
+        return Err("PET_WINDOW_REQUIRED".to_string());
+    }
+    let (event, version) = coordinator.pending_event()?;
+    let handle = lifecycle
+        .handle
+        .as_ref()
+        .ok_or_else(|| "CHAT_BRIDGE_UNAVAILABLE".to_string())?;
+    let pending =
+        handle
+            .chat_bridge()?
+            .send_update_available(window.label(), event, version, on_event)?;
+    tauri::async_runtime::spawn_blocking(move || pending.wait())
+        .await
+        .map_err(|source_error| {
+            crate::runtime_log::diagnostic_error("CHAT_DISPATCH_ABORTED", source_error)
+        })?
+}
+
+#[tauri::command]
+pub(crate) fn settings_about_get(window: WebviewWindow) -> Result<AboutSnapshot, String> {
+    product_shell::validate_settings_window(&window)?;
+    Ok(about_snapshot())
+}
+
+#[tauri::command]
+pub(crate) fn settings_about_open_website(window: WebviewWindow) -> Result<(), String> {
+    product_shell::validate_settings_window(&window)?;
+    open_website()
+}
+
+#[tauri::command]
+pub(crate) fn settings_about_open_repository(window: WebviewWindow) -> Result<(), String> {
+    product_shell::validate_settings_window(&window)?;
+    open_repository()
+}
+
+#[tauri::command]
+pub(crate) fn settings_about_open_changelog(window: WebviewWindow) -> Result<(), String> {
+    product_shell::validate_settings_window(&window)?;
+    open_changelog()
+}
+
+#[tauri::command]
+pub(crate) fn settings_about_open_sponsor(window: WebviewWindow) -> Result<(), String> {
+    product_shell::validate_settings_window(&window)?;
+    open_sponsor()
+}
+
+#[tauri::command]
+pub(crate) async fn settings_update_install(
+    window: WebviewWindow,
+    app_handle: tauri::AppHandle,
+    lifecycle: State<'_, ShellLifecycleState>,
+    runtime_log: State<'_, RuntimeLogService>,
+) -> Result<(), String> {
+    product_shell::validate_settings_window(&window)?;
+    let lifecycle_handle = lifecycle.handle.clone();
+    install(
+        &app_handle,
+        &current_executable_directory()?,
+        runtime_log.inner(),
+        move || {
+            lifecycle_handle
+                .as_ref()
+                .ok_or_else(|| "LIFECYCLE_COMMAND_UNAVAILABLE".to_string())?
+                .shutdown_and_wait(std::time::Duration::from_secs(5))
+                .map_err(|error| error.to_string())
+        },
+    )
+    .await
+}
+
+#[tauri::command]
+pub(crate) fn settings_update_open_portable_download(
+    window: WebviewWindow,
+    url: String,
+) -> Result<(), String> {
+    product_shell::validate_settings_window(&window)?;
+    open_portable_download(&url)
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn browser_launch_preserves_issue_query_and_reports_shell_failures() {
+        let url = "https://github.com/Rvosy/Sakura-Registry/issues/new?template=submit-plugin.yml&title=插件%20测试#details";
+        for status in [0, 2, 5, 31, 32, 33, 42] {
+            let result = super::open_windows_https_url(url, "OPEN_FAILED", |target| {
+                assert_eq!(target.last(), Some(&0));
+                assert_eq!(
+                    String::from_utf16(&target[..target.len() - 1]).unwrap(),
+                    url
+                );
+                status
+            });
+            assert_eq!(
+                result,
+                if status > 32 {
+                    Ok(())
+                } else {
+                    Err("OPEN_FAILED".into())
+                }
+            );
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn browser_launch_rejects_non_web_targets_before_calling_windows() {
+        for url in [
+            "file:///C:/Windows",
+            "C:\\Windows",
+            "https://example.com/\0ignored",
+            "https://user:password@example.com",
+            "javascript:alert(1)",
+        ] {
+            assert!(
+                super::open_windows_https_url(url, "OPEN_FAILED", |_| panic!(
+                    "invalid URL reached Windows"
+                ))
+                .is_err()
+            );
+        }
+    }
+
+    use super::*;
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc, Barrier,
+        },
+        time::SystemTime,
+    };
+
+    static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+    struct Fixture(PathBuf);
+
+    impl Fixture {
+        fn new() -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "sakura-update-settings-{}-{nonce}-{}",
+                std::process::id(),
+                NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed),
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn config_path(&self) -> PathBuf {
+            self.0.join("ui.json")
+        }
+
+        fn coordinator(&self) -> UpdateCoordinator {
+            UpdateCoordinator::new(UiConfigRepository::new(self.config_path()))
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn available_snapshot(version: &str) -> UpdateSnapshot {
+        UpdateSnapshot {
+            schema_version: 1,
+            current_version: "1.0.0".to_string(),
+            mode: "installed",
+            available: true,
+            version: Some(version.to_string()),
+            notes: Some("Release notes".to_string()),
+            pub_date: Some("2026-08-29T08:00:00Z".to_string()),
+            download_url: None,
+        }
+    }
+
+    #[test]
+    fn missing_update_preferences_default_to_enabled() {
+        let fixture = Fixture::new();
+        assert_eq!(
+            fixture.coordinator().preferences().unwrap(),
+            UpdatePreferencesSnapshot {
+                schema_version: 1,
+                auto_check_enabled: true,
+            }
+        );
+    }
+
+    #[test]
+    fn checked_snapshot_exposes_the_startup_result_without_consuming_it() {
+        let fixture = Fixture::new();
+        let coordinator = fixture.coordinator();
+        let snapshot = available_snapshot("1.2.0");
+        coordinator.state.lock().unwrap().checked_snapshot = Some(snapshot.clone());
+
+        assert_eq!(
+            coordinator.checked_snapshot().unwrap(),
+            Some(snapshot.clone())
+        );
+        assert_eq!(coordinator.checked_snapshot().unwrap(), Some(snapshot));
+    }
+
+    #[test]
+    fn preference_write_is_atomic_and_preserves_other_ui_settings() {
+        let fixture = Fixture::new();
+        fs::write(
+            fixture.config_path(),
+            br#"{"schema_version":1,"domain":"ui","settings":{"future":{"kept":true}}}"#,
+        )
+        .unwrap();
+        let coordinator = fixture.coordinator();
+
+        assert!(
+            !coordinator
+                .set_auto_check_enabled(false)
+                .unwrap()
+                .auto_check_enabled
+        );
+
+        let document: Value =
+            serde_json::from_slice(&fs::read(fixture.config_path()).unwrap()).unwrap();
+        assert_eq!(document["settings"]["future"]["kept"], true);
+        assert_eq!(
+            document["settings"]["update"],
+            json!({
+                "auto_check_enabled": false,
+                "last_announced_version": null,
+                "last_announced_local_date": null,
+            })
+        );
+        assert!(fs::read_dir(&fixture.0).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".tmp")));
+    }
+
+    #[test]
+    fn preference_and_terminal_marker_writes_preserve_each_other_under_concurrency() {
+        for _ in 0..32 {
+            let fixture = Fixture::new();
+            let coordinator = fixture.coordinator();
+            let barrier = Arc::new(Barrier::new(3));
+            let preference_coordinator = coordinator.clone();
+            let preference_barrier = barrier.clone();
+            let preference_write = std::thread::spawn(move || {
+                preference_barrier.wait();
+                preference_coordinator
+                    .set_auto_check_enabled(false)
+                    .unwrap();
+            });
+            let marker_coordinator = coordinator.clone();
+            let marker_barrier = barrier.clone();
+            let marker_write = std::thread::spawn(move || {
+                marker_barrier.wait();
+                marker_coordinator
+                    .observe_chat_event(&ChatEventPublication {
+                        character_id: None,
+                        presentation: None,
+                        cancel_handle: None,
+                        event_type: "chat.completed".to_string(),
+                        generation_id: "generation".to_string(),
+                        generation_number: 1,
+                        operation_id: "operation".to_string(),
+                        reply: Some(json!({"segments": []})),
+                        error: None,
+                        update_version: Some("1.2.0".to_string()),
+                    })
+                    .unwrap();
+            });
+            barrier.wait();
+            preference_write.join().unwrap();
+            marker_write.join().unwrap();
+
+            let preferences =
+                load_preferences(&UiConfigRepository::new(fixture.config_path())).unwrap();
+            assert!(!preferences.auto_check_enabled);
+            assert_eq!(preferences.last_announced_version.as_deref(), Some("1.2.0"));
+            assert_eq!(
+                preferences.last_announced_local_date.as_deref(),
+                Some(local_date().as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn daily_gate_is_scoped_to_both_version_and_local_date() {
+        let preferences = UpdatePreferences {
+            auto_check_enabled: true,
+            last_announced_version: Some("1.2.0".to_string()),
+            last_announced_local_date: Some("2026-08-29".to_string()),
+        };
+        assert!(!announcement_due(&preferences, "1.2.0", "2026-08-29"));
+        assert!(announcement_due(&preferences, "1.3.0", "2026-08-29"));
+        assert!(announcement_due(&preferences, "1.2.0", "2026-08-30"));
+    }
+
+    #[test]
+    fn completed_update_terminal_marks_success_and_clears_the_candidate() {
+        let fixture = Fixture::new();
+        let coordinator = fixture.coordinator();
+        coordinator.state.lock().unwrap().candidate = Some(UpdateCandidate {
+            snapshot: available_snapshot("1.2.0"),
+        });
+        let event = ChatEventPublication {
+            character_id: None,
+            presentation: None,
+            cancel_handle: None,
+            event_type: "chat.completed".to_string(),
+            generation_id: "generation".to_string(),
+            generation_number: 1,
+            operation_id: "operation".to_string(),
+            reply: Some(json!({"segments": []})),
+            error: None,
+            update_version: Some("1.2.0".to_string()),
+        };
+
+        coordinator.observe_chat_event(&event).unwrap();
+
+        let preferences =
+            load_preferences(&UiConfigRepository::new(fixture.config_path())).unwrap();
+        assert_eq!(preferences.last_announced_version.as_deref(), Some("1.2.0"));
+        assert_eq!(
+            preferences.last_announced_local_date.as_deref(),
+            Some(local_date().as_str())
+        );
+        let state = coordinator.state.lock().unwrap();
+        assert!(state.candidate.is_none());
+        assert_eq!(state.status, "announced");
+    }
+
+    #[test]
+    fn failed_or_unrelated_terminals_never_write_the_daily_marker() {
+        let fixture = Fixture::new();
+        let coordinator = fixture.coordinator();
+        for (event_type, update_version) in [
+            ("chat.failed", Some("1.2.0".to_string())),
+            ("chat.completed", None),
+        ] {
+            coordinator
+                .observe_chat_event(&ChatEventPublication {
+                    character_id: None,
+                    presentation: None,
+                    cancel_handle: None,
+                    event_type: event_type.to_string(),
+                    generation_id: "generation".to_string(),
+                    generation_number: 1,
+                    operation_id: "operation".to_string(),
+                    reply: None,
+                    error: None,
+                    update_version,
+                })
+                .unwrap();
+        }
+        assert!(!fixture.config_path().exists());
+    }
+
+    #[test]
+    fn candidate_event_contains_only_bounded_typed_updater_facts() {
+        let mut snapshot = available_snapshot("1.2.0");
+        snapshot.notes = bounded_optional_text(Some(format!("{}tail", "更".repeat(4000))), 4000);
+        let candidate = UpdateCandidate { snapshot };
+        let event = candidate.event();
+        assert_eq!(event["type"], "update_available");
+        assert_eq!(event["payload"]["version"], "1.2.0");
+        assert_eq!(event["payload"]["pubDate"], "2026-08-29T08:00:00Z");
+        assert_eq!(
+            event["payload"]["notes"].as_str().unwrap().chars().count(),
+            4000
+        );
+        assert_eq!(event["payload"].as_object().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn portable_manifest_url_is_explicit_and_https_only() {
+        let raw = serde_json::json!({
+            "portable": {"windows-x86_64": {"url": "https://example.test/Sakura.zip"}}
+        });
+        assert_eq!(
+            portable_download_url(&raw).unwrap(),
+            "https://example.test/Sakura.zip"
+        );
+        assert_eq!(
+            portable_download_url(&serde_json::json!({
+                "portable": {"windows-x86_64": {"url": "http://example.test/Sakura.zip"}}
+            })),
+            Err("PORTABLE_UPDATE_URL_MISSING".to_string())
+        );
+    }
+
+    #[test]
+    fn portable_flag_is_a_windows_only_contract() {
+        assert!(portable_mode(true, true));
+        assert!(!portable_mode(false, true));
+        assert!(!portable_mode(true, false));
+    }
+
+    #[test]
+    fn stable_channel_rejects_prerelease_versions() {
+        assert!(stable_release_version("1.2.0"));
+        assert!(stable_release_version("1.2.0+build.7"));
+        assert!(!stable_release_version("1.2.0-rc.1"));
+        assert!(!stable_release_version("1.2.0-beta.2+build.7"));
+    }
+
+    #[test]
+    fn updater_download_timeout_is_not_the_manifest_check_timeout() {
+        assert_eq!(UPDATE_CHECK_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(UPDATE_DOWNLOAD_TIMEOUT, Duration::from_secs(30 * 60));
+        assert!(UPDATE_DOWNLOAD_TIMEOUT > UPDATE_CHECK_TIMEOUT);
+    }
+
+    #[test]
+    fn updater_proxy_snapshot_records_presence_without_values() {
+        let environment = std::collections::HashMap::from([
+            (
+                "HTTPS_PROXY",
+                OsString::from("http://user:private@example.test:8080"),
+            ),
+            ("NO_PROXY", OsString::from("localhost")),
+        ]);
+        let snapshot = proxy_environment_snapshot_with(|name| environment.get(name).cloned());
+
+        assert_eq!(snapshot["proxy_mode"], "system_and_environment");
+        assert_eq!(snapshot["proxy_http_configured"], false);
+        assert_eq!(snapshot["proxy_https_configured"], true);
+        assert_eq!(snapshot["proxy_all_configured"], false);
+        assert_eq!(snapshot["proxy_no_proxy_configured"], true);
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+        assert!(!encoded.contains("private"));
+        assert!(!encoded.contains("example.test"));
+    }
+
+    #[test]
+    fn updater_request_failure_for_latest_json_keeps_network_classification_and_sources() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = [0; 2048];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            stream.write_all(b"invalid HTTP response\r\n\r\n").unwrap();
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let error = runtime.block_on(async {
+            reqwest::Client::builder()
+                .no_proxy()
+                .retry(reqwest::retry::never())
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap()
+                .get(format!("http://{address}/latest.json"))
+                .send()
+                .await
+                .unwrap_err()
+        });
+        server.join().unwrap();
+        let attributes = updater_error_attributes(&UpdaterError::Reqwest(error), "check");
+
+        assert_eq!(attributes["reason_code"], "NETWORK");
+        assert_eq!(attributes["cause_type"], "Reqwest");
+        assert_eq!(attributes["is_timeout"], false);
+        assert_eq!(attributes["is_connect"], false);
+        assert!(attributes["diagnostic"]
+            .as_str()
+            .unwrap()
+            .contains("latest.json"));
+        assert!(attributes["exception_chain"]
+            .as_str()
+            .unwrap()
+            .contains("Caused by: "));
+        assert!(!attributes.contains_key("http_status"));
+    }
+
+    #[test]
+    fn updater_parse_failures_and_missing_release_are_not_network_guesses() {
+        let parsing = serde_json::from_str::<Value>("{").unwrap_err();
+        let attributes = updater_error_attributes(&UpdaterError::Serialization(parsing), "check");
+        assert_eq!(attributes["reason_code"], "MANIFEST");
+        assert_eq!(attributes["cause_type"], "Serialization");
+        assert!(!attributes.contains_key("is_timeout"));
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let response: reqwest::Response = tauri::http::Response::builder()
+            .status(200)
+            .body("not JSON")
+            .unwrap()
+            .into();
+        let parsing = runtime.block_on(response.json::<Value>()).unwrap_err();
+        assert_eq!(
+            classify_updater_error(&UpdaterError::Reqwest(parsing), "check"),
+            "MANIFEST"
+        );
+        assert_eq!(
+            classify_updater_error(&UpdaterError::ReleaseNotFound, "check"),
+            "RELEASE_RESPONSE"
+        );
+        assert_eq!(
+            classify_updater_error(
+                &UpdaterError::Io(std::io::ErrorKind::TimedOut.into()),
+                "check"
+            ),
+            "TIMEOUT"
+        );
+        assert_eq!(
+            classify_updater_error(
+                &UpdaterError::SignatureUtf8("invalid".to_string()),
+                "download"
+            ),
+            "SIGNATURE"
+        );
+    }
+
+    #[test]
+    fn updater_http_status_and_target_are_taken_from_known_error_shapes() {
+        let response: reqwest::Response = tauri::http::Response::builder()
+            .status(403)
+            .body("")
+            .unwrap()
+            .into();
+        let error = response.error_for_status().unwrap_err().with_url(
+            "https://github.com/Rvosy/Sakura/releases/latest/download/latest.json?token=private"
+                .parse()
+                .unwrap(),
+        );
+        let attributes = updater_error_attributes(&UpdaterError::Reqwest(error), "check");
+        assert_eq!(attributes["reason_code"], "HTTP");
+        assert_eq!(attributes["http_status"], 403);
+        assert_eq!(attributes["endpoint_alias"], "github_release");
+        let error = UpdaterError::Network(
+            "Download request failed with status: 503 Service Unavailable".to_string(),
+        );
+        let attributes = updater_error_attributes(&error, "download");
+        assert_eq!(attributes["reason_code"], "HTTP");
+        assert_eq!(attributes["http_status"], 503);
+
+        let error = UpdaterError::Network("custom latest.json status code 700".to_string());
+        let attributes = updater_error_attributes(&error, "check");
+        assert_eq!(attributes["reason_code"], "NETWORK");
+        assert!(!attributes.contains_key("http_status"));
+        assert_eq!(
+            updater_endpoint_alias(
+                &"https://github.com.private.test/Rvosy/Sakura/releases/latest"
+                    .parse()
+                    .unwrap()
+            ),
+            "other"
+        );
+    }
+
+    #[derive(Debug)]
+    struct UpdaterTestCause {
+        message: String,
+        source: Option<Box<Self>>,
+    }
+
+    impl std::fmt::Display for UpdaterTestCause {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str(&self.message)
+        }
+    }
+
+    impl StdError for UpdaterTestCause {
+        fn source(&self) -> Option<&(dyn StdError + 'static)> {
+            self.source.as_deref().map(|error| error as _)
+        }
+    }
+
+    #[test]
+    fn updater_sources_reach_logs_with_credentials_redacted_and_safe_details_preserved() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("updater.log");
+        let log = RuntimeLogService::start_with_config(
+            crate::runtime_log::RuntimeLogConfig::production(path.clone()),
+        );
+        let cause = UpdaterTestCause {
+            message: "installer request failed".to_string(),
+            source: Some(Box::new(UpdaterTestCause {
+                message: format!(
+                    "{} TLS certificate expired for https://user:private@example.test/latest.json?token=test-secret&channel=stable; api_key=other-private",
+                    "x".repeat(500),
+                ),
+                source: None,
+            })),
+        };
+        let error = UpdaterError::Io(std::io::Error::other(cause));
+        log_updater_error(
+            &log,
+            "updater.check.failed",
+            "check",
+            "manual",
+            "installed",
+            "UPDATE_CHECK_FAILED",
+            &error,
+            Instant::now(),
+        );
+        log.drain_and_shutdown_for_test();
+        let text = fs::read_to_string(path).unwrap();
+        assert!(text.contains("TLS certificate expired"));
+        assert!(text.contains("example.test/latest.json"));
+        assert!(text.contains("channel=stable"));
+        for secret in ["user:private", "test-secret", "other-private"] {
+            assert!(!text.contains(secret), "unredacted credential: {secret}");
+        }
+    }
+
+    #[test]
+    fn updater_source_traversal_has_a_depth_bound() {
+        let mut cause = UpdaterTestCause {
+            message: "leaf".to_string(),
+            source: None,
+        };
+        for _ in 0..20 {
+            cause = UpdaterTestCause {
+                message: "nested".to_string(),
+                source: Some(Box::new(cause)),
+            };
+        }
+        let attributes =
+            updater_error_attributes(&UpdaterError::Io(std::io::Error::other(cause)), "install");
+        let chain = attributes["exception_chain"].as_str().unwrap();
+        assert!(chain.ends_with("[source chain truncated]"));
+        assert_eq!(
+            chain.matches("Caused by: ").count(),
+            UPDATE_ERROR_CHAIN_LIMIT
+        );
+    }
+
+    #[test]
+    fn installed_update_prepares_windows_exit_only_on_windows() {
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let callback_called = called.clone();
+        prepare_installed_update_exit(true, move || {
+            callback_called.store(true, Ordering::Relaxed);
+            Ok(())
+        })
+        .unwrap();
+        assert!(called.load(Ordering::Relaxed));
+
+        prepare_installed_update_exit(false, || Err("must not run".to_string())).unwrap();
+        assert_eq!(
+            prepare_installed_update_exit(true, || Err("shutdown failed".to_string())),
+            Err("shutdown failed".to_string())
+        );
+    }
+
+    #[test]
+    fn about_snapshot_and_product_links_are_fixed() {
+        assert_eq!(
+            about_snapshot(),
+            AboutSnapshot {
+                schema_version: 1,
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                repository_url: "https://github.com/Rvosy/Sakura",
+            }
+        );
+        assert_eq!(WEBSITE_URL, "https://sakura.cialloo.cn/");
+        assert_eq!(
+            CHANGELOG_URL,
+            "https://github.com/Rvosy/Sakura/blob/main/docs/CHANGELOG.md"
+        );
+        assert_eq!(SPONSOR_URL, "https://ifdian.net/a/Rvosy");
+    }
+}
